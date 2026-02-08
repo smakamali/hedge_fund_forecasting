@@ -2,5 +2,16 @@
 *.parquet
 *.csv
 
-# Compressed files
+# archive files
+*.tar.gz
 *.zip
+
+# archive folder
+archive/
+
+# mlrun files
+mlruns/
+mlflow.db
+
+# cache files
+__pycache__/
