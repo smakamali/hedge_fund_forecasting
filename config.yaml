@@ -3,5 +3,5 @@
 input_lags:
   lags_max: 5
   top_k_per_feature: 2
-  use_global_lags: false
-  global_lags: null   # or [1, 2, 3, 5] when use_global_lags is true
+  use_global_lags: True
+  global_lags: [1]   # null for no global lags

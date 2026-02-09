@@ -53,9 +53,10 @@ def encode_entity_categoricals(
     Fit (encodings=None) or transform (encodings provided). Unseen categories -> -1 (LightGBM treats as missing).
     Returns (df with *_enc columns, encodings dict).
     """
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     if encodings is None:
         encodings = {}
+    new_cols = {}
     for col in cat_cols:
         if col not in df.columns:
             continue
@@ -63,7 +64,9 @@ def encode_entity_categoricals(
             uniques = df_out[col].astype(str).dropna().unique()
             encodings[col] = {v: i for i, v in enumerate(sorted(uniques))}
         mapping = encodings[col]
-        df_out[col + "_enc"] = df_out[col].astype(str).map(mapping).fillna(-1).astype(np.int32)
+        new_cols[col + "_enc"] = df_out[col].astype(str).map(mapping).fillna(-1).astype(np.int32)
+    if new_cols:
+        df_out = pd.concat([df_out, pd.DataFrame(new_cols, index=df_out.index)], axis=1)
     return df_out, encodings
 
 
@@ -108,7 +111,7 @@ def temporal_impute_missing(df: pd.DataFrame, feature_cols: List[str], method: s
     Impute missing values using statistics from df (train set).
     Returns (df_imputed, impute_values dict).
     """
-    df_imputed = df.copy()
+    df_imputed = df.copy(deep=False)
     impute_values = {}
     for col in feature_cols:
         if col not in df.columns:
@@ -127,7 +130,7 @@ def temporal_impute_missing(df: pd.DataFrame, feature_cols: List[str], method: s
 
 def apply_imputation(df: pd.DataFrame, impute_values: Dict[str, float]) -> pd.DataFrame:
     """Apply pre-computed imputation values to a dataframe."""
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     for col, val in impute_values.items():
         if col in df_out.columns:
             df_out[col] = df_out[col].fillna(val)
@@ -136,16 +139,17 @@ def apply_imputation(df: pd.DataFrame, impute_values: Dict[str, float]) -> pd.Da
 
 def create_missing_indicators(df: pd.DataFrame, feature_cols: List[str], missing_threshold: float = 0.01) -> tuple:
     """Create binary is_missing columns for features with missing rate > threshold. Returns (df, indicator_cols)."""
-    df_out = df.copy()
     indicator_cols = []
+    new_cols = {}
     for col in feature_cols:
         if col not in df.columns:
             continue
         missing_rate = df[col].isna().mean()
         if missing_rate > missing_threshold:
             indicator_col = f"{col}_is_missing"
-            df_out[indicator_col] = df[col].isna().astype(int)
+            new_cols[indicator_col] = df[col].isna().astype(int)
             indicator_cols.append(indicator_col)
+    df_out = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1) if new_cols else df.copy(deep=False)
     return df_out, indicator_cols
 
 
@@ -206,7 +210,7 @@ def create_aggregate_features_t1(
     Global and per-group mean of y_target using only ts_index < t (t-1 discipline).
     For each ts_index t, we use mean of all rows with ts_index < t.
     """
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     agg_cols = []
     by_ts = df.groupby(ts_col)[target_col].agg(['sum', 'count']).sort_index()
     cumsum = by_ts['sum'].cumsum().shift(1)
@@ -239,7 +243,7 @@ def winsorize_features(
     Returns (df_winsorized, bounds_dict).
     """
     fit_df = fit_df if fit_df is not None else df
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     bounds = {}
     for col in feature_cols:
         if col not in fit_df.columns:
@@ -253,7 +257,7 @@ def winsorize_features(
 
 def apply_winsorize_bounds(df: pd.DataFrame, bounds: Dict[str, tuple]) -> pd.DataFrame:
     """Apply pre-computed winsorize bounds to df."""
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     for col, (q_low, q_high) in bounds.items():
         if col in df_out.columns:
             df_out[col] = df_out[col].clip(lower=q_low, upper=q_high)
@@ -262,7 +266,7 @@ def apply_winsorize_bounds(df: pd.DataFrame, bounds: Dict[str, tuple]) -> pd.Dat
 
 def log_transform_type_c(df: pd.DataFrame, type_c_cols: List[str]) -> pd.DataFrame:
     """Apply log(1+x) to Type C (large-scale) features."""
-    df_out = df.copy()
+    df_out = df.copy(deep=False)
     for col in type_c_cols:
         if col in df_out.columns:
             df_out[col] = np.log1p(df_out[col].clip(lower=0))
@@ -271,14 +275,15 @@ def log_transform_type_c(df: pd.DataFrame, type_c_cols: List[str]) -> pd.DataFra
 
 def create_zero_inflation_flags(df: pd.DataFrame, zero_inflated_cols: List[str]) -> tuple:
     """Add binary is_zero columns for given features. Returns (df, flag_cols)."""
-    df_out = df.copy()
     flag_cols = []
+    new_cols = {}
     for col in zero_inflated_cols:
         if col not in df.columns:
             continue
         flag_col = f"{col}_is_zero"
-        df_out[flag_col] = (df[col] == 0).astype(int)
+        new_cols[flag_col] = (df[col] == 0).astype(int)
         flag_cols.append(flag_col)
+    df_out = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1) if new_cols else df.copy(deep=False)
     return df_out, flag_cols
 
 
@@ -361,6 +366,7 @@ def create_input_lag_features(
     entity_chunk_size: Optional[int] = None,
     lag_dtype: type = np.float32,
     batch_size: int = 20,
+    use_float16_when_large: bool = False,
 ) -> tuple:
     """
     Time-delay-embedding style: add lagged input features per entity (past only).
@@ -371,6 +377,8 @@ def create_input_lag_features(
     - entity_chunk_size: process entities in chunks (default: 500 when rows > 500k, else None).
     - lag_dtype: np.float32 to halve memory vs float64 (default: float32).
     - batch_size: add lag columns in batches to avoid peak memory from one large concat.
+    - use_float16_when_large: if True and n_rows > 500k, use float16 for lag columns (half memory vs float32).
+      Caution: float16 has limited range (~±65504); extreme values may overflow.
     """
     df_out = df.sort_values(entity_cols + [ts_col]).copy()
     n_rows = len(df_out)
@@ -394,7 +402,7 @@ def create_input_lag_features(
     if entity_chunk_size is not None and entity_chunk_size <= 0:
         entity_chunk_size = None
 
-    _lag_dtype = lag_dtype
+    _lag_dtype = np.float16 if (use_float16_when_large and n_rows > 500_000) else lag_dtype
 
     if entity_chunk_size is not None:
         # Process by entity chunks: lower peak memory

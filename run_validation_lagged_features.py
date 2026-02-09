@@ -112,6 +112,8 @@ def _build_train_features(
     top_k_per_feature=2,
     use_global_lags=False,
     global_lags=None,
+    use_float16_when_large=False,
+    y_lags=None,
 ):
     """Full feature pipeline on train (has y_target). Returns (train_fe, all_feature_cols, artifacts)."""
     train_imputed, impute_values = temporal_impute_missing(train_df, FEATURE_COLS, method="median")
@@ -128,8 +130,9 @@ def _build_train_features(
 
     lag_cols = []
     if use_target_lags:
+        lags = y_lags if y_lags is not None else Y_LAGS
         train_imputed, lag_cols = create_lag_features(
-            train_imputed, ENTITY_COLS, TARGET_COL, TS_COL, lags=Y_LAGS
+            train_imputed, ENTITY_COLS, TARGET_COL, TS_COL, lags=lags
         )
     rolling_cols = []
     if use_rolling:
@@ -166,6 +169,7 @@ def _build_train_features(
         )
         train_imputed, input_lag_cols = create_input_lag_features(
             train_imputed, ENTITY_COLS, TS_COL, FEATURE_COLS, lag_spec,
+            use_float16_when_large=use_float16_when_large,
         )
     extra_feature_cols = lag_cols + rolling_cols + agg_cols + [entity_count_col] + input_lag_cols
 
@@ -220,6 +224,9 @@ def _build_train_features(
         "entity_count_col": entity_count_col,
         "input_lag_cols": input_lag_cols,
         "lag_spec": lag_spec,
+        "use_float16_when_large": use_float16_when_large,
+        "y_lags": (y_lags if y_lags is not None else Y_LAGS) if use_target_lags else [],
+        "windows": WINDOWS if use_rolling else [],
         "global_mean": global_mean,
         "global_std": global_std,
         "entity_mean_from_train": entity_mean_from_train,
@@ -232,15 +239,17 @@ def _build_train_features(
 
 
 def _build_val_features(val_df, artifacts, train_fe=None):
-    """Build val feature matrix. y_target lags/rolling/agg use per-entity train mean/std fallbacks.
-    Input lag features: if train_fe is provided, compute from combined train+val (real values);
-    otherwise fallback to 0."""
+    """Build val feature matrix.
+    Input lag features: if train_fe is provided, compute from combined train+val (real values); else fallback to 0.
+    Target-derived features (lags, rolling, agg): if train_fe is provided, compute from combined train+val (real values);
+    otherwise use per-entity train mean/std fallbacks."""
     impute_values = artifacts["impute_values"]
     winsor_bounds = artifacts["winsor_bounds"]
     lag_cols = artifacts["lag_cols"]
     rolling_cols = artifacts["rolling_cols"]
     input_lag_cols = artifacts.get("input_lag_cols", [])
     lag_spec = artifacts.get("lag_spec")
+    use_float16_when_large = artifacts.get("use_float16_when_large", False)
     global_mean = artifacts["global_mean"]
     global_std = artifacts["global_std"]
     entity_mean_from_train = artifacts["entity_mean_from_train"]
@@ -273,7 +282,8 @@ def _build_val_features(val_df, artifacts, train_fe=None):
         combined = pd.concat([train_base, val_base], ignore_index=True)
         combined = combined.sort_values(ENTITY_COLS + [TS_COL])
         combined, _ = create_input_lag_features(
-            combined, ENTITY_COLS, TS_COL, FEATURE_COLS, lag_spec
+            combined, ENTITY_COLS, TS_COL, FEATURE_COLS, lag_spec,
+            use_float16_when_large=use_float16_when_large,
         )
         val_mask = combined["_val_ord"] >= 0
         val_input_lags = combined.loc[val_mask].sort_values("_val_ord")[input_lag_cols]
@@ -284,26 +294,60 @@ def _build_val_features(val_df, artifacts, train_fe=None):
     else:
         val_input_lags = None
 
-    # y_target-derived fallbacks: per-entity mean (lags, rolling mean) and per-entity std (rolling std)
+    # Target-derived features: compute from combined train+val when train_fe provided (real values)
     agg_cols = artifacts.get("agg_cols", [])
-    horizon_numeric = val_imputed["horizon"].astype(float)
-    extra_cols = {}
-    for c in lag_cols:
-        extra_cols[c] = val_imputed["entity_mean"].values
-    for c in rolling_cols:
-        if "rolling_std" in c:
-            extra_cols[c] = 0.0
-        else:
+    target_derived_cols = lag_cols + rolling_cols + agg_cols
+    target_transform = artifacts.get("target_transform")
+
+    if train_fe is not None and target_derived_cols:
+        train_base = train_fe[ENTITY_COLS + [TS_COL, TARGET_COL]].copy()
+        train_base["_val_ord"] = -1
+        val_base = val_imputed[ENTITY_COLS + [TS_COL, TARGET_COL]].copy()
+        if target_transform is not None:
+            val_base[TARGET_COL] = transform_target(val_df[TARGET_COL].to_numpy(), target_transform)
+        val_base["_val_ord"] = np.arange(len(val_base))
+        combined = pd.concat([train_base, val_base], ignore_index=True)
+        combined = combined.sort_values(ENTITY_COLS + [TS_COL])
+        y_lags_list = artifacts.get("y_lags", [])
+        windows_list = artifacts.get("windows", WINDOWS)
+        if lag_cols and y_lags_list:
+            combined, _ = create_lag_features(
+                combined, ENTITY_COLS, TARGET_COL, TS_COL, lags=y_lags_list
+            )
+        if rolling_cols and windows_list:
+            combined, _ = create_rolling_features(
+                combined, ENTITY_COLS, TARGET_COL, TS_COL, windows=windows_list
+            )
+        if agg_cols:
+            combined, _ = create_aggregate_features_t1(
+                combined, TARGET_COL, TS_COL, group_col="sub_category"
+            )
+        val_mask = combined["_val_ord"] >= 0
+        val_target_derived = combined.loc[val_mask].sort_values("_val_ord")[target_derived_cols]
+        val_target_derived_df = pd.DataFrame(
+            val_target_derived.values, index=val_imputed.index, columns=target_derived_cols
+        )
+        val_imputed = pd.concat([val_imputed, val_target_derived_df], axis=1)
+    else:
+        extra_cols = {}
+        for c in lag_cols:
             extra_cols[c] = val_imputed["entity_mean"].values
-    if agg_cols:
-        extra_cols["y_target_global_mean"] = val_imputed["entity_mean"].values
-        extra_cols["y_target_sub_category_mean"] = val_imputed["entity_mean"].values
-    if val_input_lags is None and input_lag_cols:
-        for c in input_lag_cols:
-            extra_cols[c] = 0.0
-    if extra_cols:
-        extra = pd.DataFrame(extra_cols, index=val_imputed.index)
-        val_imputed = pd.concat([val_imputed, extra], axis=1)
+        for c in rolling_cols:
+            if "rolling_std" in c:
+                extra_cols[c] = 0.0
+            else:
+                extra_cols[c] = val_imputed["entity_mean"].values
+        if agg_cols:
+            extra_cols["y_target_global_mean"] = val_imputed["entity_mean"].values
+            extra_cols["y_target_sub_category_mean"] = val_imputed["entity_mean"].values
+        if val_input_lags is None and input_lag_cols:
+            for c in input_lag_cols:
+                extra_cols[c] = 0.0
+        if extra_cols:
+            extra = pd.DataFrame(extra_cols, index=val_imputed.index)
+            val_imputed = pd.concat([val_imputed, extra], axis=1)
+
+    horizon_numeric = val_imputed["horizon"].astype(float)
 
     val_imputed = val_imputed.merge(entity_count_from_train, on=ENTITY_COLS, how="left")
     val_imputed["entity_obs_count"] = val_imputed["entity_obs_count"].fillna(0)
@@ -392,58 +436,28 @@ def _run_validation(
     global_lags=None,
 ):
     logger.info("Loading train...")
-    train_df = pd.read_parquet("train.parquet")
-    train_part, val_df, cutoff = temporal_train_test_split(
-        train_df, ts_col=TS_COL, test_size=0.2
-    )
-
-    logger.info(
-        "Building train features (target_lags=%s, rolling=%s, aggregates=%s, input_lags=%s, target_transform=%s)...",
-        use_target_lags, use_rolling, use_aggregates, use_input_lags, use_target_transform,
-    )
-    train_fe, all_feature_cols, artifacts = _build_train_features(
-        train_part,
+    dataset = prepare_dataset_for_lag_config(
+        use_input_lags=use_input_lags,
         use_target_lags=use_target_lags,
         use_rolling=use_rolling,
         use_aggregates=use_aggregates,
-        use_input_lags=use_input_lags,
         use_target_transform=use_target_transform,
         lags_max=lags_max,
         top_k_per_feature=top_k_per_feature,
         use_global_lags=use_global_lags,
         global_lags=global_lags,
     )
+    if not use_input_lags:
+        logger.info("Excluding input lag features (--no-input-lags).")
 
-    logger.info(
-        "Building val features (fallbacks for y_target-derived; input lags from train+val when used)..."
-    )
-    val_fe = _build_val_features(
-        val_df, artifacts, train_fe=train_fe if use_input_lags else None
-    )
-
-    if use_input_lags:
-        feature_cols_final = all_feature_cols
-    else:
-        input_lag_cols = set(artifacts.get("input_lag_cols", []))
-        feature_cols_final = [c for c in all_feature_cols if c not in input_lag_cols]
-        logger.info("Excluding %s input lag features (--no-input-lags).", len(input_lag_cols))
-
-    for c in feature_cols_final:
-        if c not in val_fe.columns:
-            val_fe[c] = 0.0
-
-    X_train = train_fe[feature_cols_final].fillna(0).to_numpy()
-    y_train = train_fe[TARGET_COL].to_numpy()  # transformed (model trains on this)
-    w_train = train_fe["weight"].to_numpy()
-    X_val = val_fe[feature_cols_final].fillna(0).to_numpy()
-    y_val_orig = val_df[TARGET_COL].to_numpy()  # original (for metrics)
-    w_val = val_df["weight"].to_numpy()
-    # Original-space targets in train_fe row order (merge on entity+ts; index may differ after pipeline)
-    _keys = ENTITY_COLS + [TS_COL]
-    _right = train_part[_keys + [TARGET_COL]].drop_duplicates(subset=_keys, keep="first")
-    _merged = train_fe[_keys].merge(_right, on=_keys, how="left")
-    y_train_orig = _merged[TARGET_COL].to_numpy()
-    target_transform = artifacts.get("target_transform")
+    X_train = dataset["X_train"]
+    y_train = dataset["y_train"]
+    w_train = dataset["w_train"]
+    X_val = dataset["X_val"]
+    y_val_orig = dataset["y_val_orig"]
+    w_val = dataset["w_val"]
+    feature_cols_final = dataset["feature_cols_final"]
+    target_transform = dataset["target_transform"]
 
     # --- Debug Step 1: targets and weights ---
     logger.debug("--- Debug Step 1: targets and weights ---")
@@ -485,7 +499,7 @@ def _run_validation(
 
     params = {
         "objective": "regression",
-        "metric": "None",  # Use feval (val_skill) for early stopping; higher is better
+        "metric": "None",
         "boosting_type": "gbdt",
         "num_leaves": 31,
         "learning_rate": 0.1,
@@ -500,25 +514,6 @@ def _run_validation(
     }
     if use_mlflow:
         mlflow.log_params({k: str(v) for k, v in params.items()})
-    train_data = lgb.Dataset(
-        X_train,
-        label=y_train,
-        weight=w_train,
-        feature_name=feature_cols_final,
-        categorical_feature=[c for c in ENTITY_CAT_FEATURE_NAMES if c in feature_cols_final],
-    )
-    # Validation targets in model space (transformed if target_transform enabled)
-    y_val_model = (
-        transform_target(val_df[TARGET_COL].to_numpy(), target_transform)
-        if target_transform is not None
-        else val_df[TARGET_COL].to_numpy()
-    )
-    val_data = lgb.Dataset(
-        X_val,
-        label=y_val_model,
-        weight=w_val,
-        reference=train_data,
-    )
     parts = ["base"]
     if use_target_lags:
         parts.append("target_lags")
@@ -529,33 +524,20 @@ def _run_validation(
     if use_input_lags:
         parts.append("input_lags")
     logger.info("Training model (%s)...", " + ".join(parts))
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=1000,
-        valid_sets=[val_data],
-        valid_names=["val"],
-        feval=make_skill_feval(y_val_orig, w_val, target_transform),
-        callbacks=[
-            lgb.log_evaluation(0),
-            lgb.early_stopping(stopping_rounds=50, verbose=False),
-        ],
+    val_skill, train_skill, val_rmse, train_rmse, n_rounds, model = train_and_evaluate(
+        dataset,
+        num_leaves=31,
+        min_data_in_leaf=20,
+        max_depth=-1,
+        use_skill_feval=True,
+        return_model=True,
     )
-
-    pred_train_t = model.predict(X_train)
     pred_val_t = model.predict(X_val)
-    if target_transform is not None:
-        pred_train = inverse_transform_target(pred_train_t, target_transform)
-        pred_val = inverse_transform_target(pred_val_t, target_transform)
-    else:
-        pred_train = pred_train_t
-        pred_val = pred_val_t
-
-    # --- Train and validation metrics (original space: raw RMSE + skill score) ---
-    train_rmse = np.sqrt(np.mean((y_train_orig - pred_train) ** 2))
-    train_skill = weighted_rmse_score(y_train_orig, pred_train, w_train)
-    val_rmse = np.sqrt(np.mean((y_val_orig - pred_val) ** 2))
-    val_skill = weighted_rmse_score(y_val_orig, pred_val, w_val)
+    pred_val = (
+        inverse_transform_target(pred_val_t, target_transform)
+        if target_transform is not None
+        else pred_val_t
+    )
     logger.info(
         "Train:      RMSE=%.6f  skill=%.6f",
         train_rmse, train_skill,
@@ -616,6 +598,173 @@ def _run_validation(
     logger.debug("(If most of the metric is in few rows, improving those predictions will bring ratio below 1.)")
 
     return val_skill
+
+
+def prepare_dataset_for_lag_config(
+    use_input_lags=True,
+    use_target_lags=False,
+    use_rolling=False,
+    use_aggregates=False,
+    use_target_transform=False,
+    lags_max=5,
+    top_k_per_feature=2,
+    use_global_lags=False,
+    global_lags=None,
+    use_float16_when_large=False,
+    y_lags=None,
+):
+    """
+    Load data, build features, and extract arrays for a given lag config.
+    Used by run_tune_lgb_params to avoid repeating data generation per param combo.
+    Returns dict with X_train, y_train, w_train, X_val, y_val_orig, w_val,
+    feature_cols_final, target_transform, y_train_orig, entity_cat_feature_names.
+    """
+    train_df = pd.read_parquet("train.parquet")
+    train_part, val_df, cutoff = temporal_train_test_split(
+        train_df, ts_col=TS_COL, test_size=0.2
+    )
+    train_fe, all_feature_cols, artifacts = _build_train_features(
+        train_part,
+        use_target_lags=use_target_lags,
+        use_rolling=use_rolling,
+        use_aggregates=use_aggregates,
+        use_input_lags=use_input_lags,
+        use_target_transform=use_target_transform,
+        lags_max=lags_max,
+        top_k_per_feature=top_k_per_feature,
+        use_global_lags=use_global_lags,
+        global_lags=global_lags,
+        use_float16_when_large=use_float16_when_large,
+        y_lags=y_lags,
+    )
+    needs_train_fe = use_input_lags or use_target_lags or use_rolling or use_aggregates
+    val_fe = _build_val_features(
+        val_df, artifacts, train_fe=train_fe if needs_train_fe else None
+    )
+    if use_input_lags:
+        feature_cols_final = all_feature_cols
+    else:
+        input_lag_cols = set(artifacts.get("input_lag_cols", []))
+        feature_cols_final = [c for c in all_feature_cols if c not in input_lag_cols]
+    for c in feature_cols_final:
+        if c not in val_fe.columns:
+            val_fe[c] = 0.0
+    X_train = train_fe[feature_cols_final].fillna(0).to_numpy()
+    y_train = train_fe[TARGET_COL].to_numpy()
+    w_train = train_fe["weight"].to_numpy()
+    X_val = val_fe[feature_cols_final].fillna(0).to_numpy()
+    y_val_orig = val_df[TARGET_COL].to_numpy()
+    w_val = val_df["weight"].to_numpy()
+    _keys = ENTITY_COLS + [TS_COL]
+    _right = train_part[_keys + [TARGET_COL]].drop_duplicates(subset=_keys, keep="first")
+    _merged = train_fe[_keys].merge(_right, on=_keys, how="left")
+    y_train_orig = _merged[TARGET_COL].to_numpy()
+    target_transform = artifacts.get("target_transform")
+    entity_cat_feature_names = [c for c in ENTITY_CAT_FEATURE_NAMES if c in feature_cols_final]
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "w_train": w_train,
+        "X_val": X_val,
+        "y_val_orig": y_val_orig,
+        "w_val": w_val,
+        "feature_cols_final": feature_cols_final,
+        "target_transform": target_transform,
+        "y_train_orig": y_train_orig,
+        "entity_cat_feature_names": entity_cat_feature_names,
+    }
+
+
+def train_and_evaluate(
+    dataset,
+    num_leaves=31,
+    min_data_in_leaf=20,
+    max_depth=-1,
+    use_skill_feval=True,
+    return_model=False,
+):
+    """
+    Train LightGBM with given tree params and return metrics. No MLflow.
+    dataset: dict from prepare_dataset_for_lag_config.
+    use_skill_feval: if True, use make_skill_feval for early stopping; else use RMSE.
+    return_model: if True, return model as 6th element (for MLflow logging).
+    Returns (val_skill, train_skill, val_rmse, train_rmse, num_boost_round_actual[, model]).
+    """
+    X_train = dataset["X_train"]
+    y_train = dataset["y_train"]
+    w_train = dataset["w_train"]
+    X_val = dataset["X_val"]
+    y_val_orig = dataset["y_val_orig"]
+    w_val = dataset["w_val"]
+    feature_cols_final = dataset["feature_cols_final"]
+    target_transform = dataset["target_transform"]
+    y_train_orig = dataset["y_train_orig"]
+    entity_cat_feature_names = dataset["entity_cat_feature_names"]
+    y_val_model = (
+        transform_target(y_val_orig, target_transform)
+        if target_transform is not None
+        else y_val_orig.copy()
+    )
+    params = {
+        "objective": "regression",
+        "metric": "None" if use_skill_feval else "rmse",
+        "boosting_type": "gbdt",
+        "num_leaves": num_leaves,
+        "learning_rate": 0.1,
+        "feature_fraction": 1.0,
+        "bagging_fraction": 1.0,
+        "bagging_freq": 0,
+        "verbose": -1,
+        "min_data_in_leaf": min_data_in_leaf,
+        "lambda_l1": 0.0,
+        "lambda_l2": 0.0,
+        "seed": 42,
+    }
+    if max_depth > 0:
+        params["max_depth"] = max_depth
+    train_data = lgb.Dataset(
+        X_train,
+        label=y_train,
+        weight=w_train,
+        feature_name=feature_cols_final,
+        categorical_feature=entity_cat_feature_names,
+    )
+    val_data = lgb.Dataset(
+        X_val,
+        label=y_val_model,
+        weight=w_val,
+        reference=train_data,
+    )
+    callbacks = [
+        lgb.log_evaluation(0),
+        lgb.early_stopping(stopping_rounds=50, verbose=False),
+    ]
+    feval = make_skill_feval(y_val_orig, w_val, target_transform) if use_skill_feval else None
+    model = lgb.train(
+        params,
+        train_data,
+        num_boost_round=1000,
+        valid_sets=[val_data],
+        valid_names=["val"],
+        feval=feval,
+        callbacks=callbacks,
+    )
+    pred_train_t = model.predict(X_train)
+    pred_val_t = model.predict(X_val)
+    if target_transform is not None:
+        pred_train = inverse_transform_target(pred_train_t, target_transform)
+        pred_val = inverse_transform_target(pred_val_t, target_transform)
+    else:
+        pred_train = pred_train_t
+        pred_val = pred_val_t
+    train_rmse = np.sqrt(np.mean((y_train_orig - pred_train) ** 2))
+    train_skill = weighted_rmse_score(y_train_orig, pred_train, w_train)
+    val_rmse = np.sqrt(np.mean((y_val_orig - pred_val) ** 2))
+    val_skill = weighted_rmse_score(y_val_orig, pred_val, w_val)
+    out = (val_skill, train_skill, val_rmse, train_rmse, model.best_iteration)
+    if return_model:
+        out = out + (model,)
+    return out
 
 
 if __name__ == "__main__":
