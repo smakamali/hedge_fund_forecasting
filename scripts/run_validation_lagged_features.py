@@ -1,24 +1,31 @@
 """
 Validation experiment: base features plus y_target lags/rolling/aggregates (autoregressive)
-and optional input lag features. Self-contained; only imports from preprocessing and evaluation.
-Run: conda run -n forecast_fund python run_validation_lagged_features.py
+and optional input lag features. Self-contained; only imports from src (preprocessing, evaluation, config_loader).
+Run: from project root: python scripts/run_validation_lagged_features.py (or conda run -n forecast_fund python scripts/run_validation_lagged_features.py)
 Optional flags: --no-input-lags, --no-target-lags, --no-rolling, --no-aggregates
 Config: lag params (lags_max, top_k_per_feature, use_global_lags, global_lags) loaded from config.yaml or --config path.
 To see step-by-step debug diagnostics, set logging level to DEBUG.
 MLflow tracking is enabled by default; use --no-mlflow to disable.
 """
 import argparse
-import json
 import logging
 import os
+import sys
 import tempfile
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 import mlflow
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from evaluation import temporal_train_test_split, weighted_rmse_score, make_skill_feval
-from preprocessing import (
+from src.evaluation import temporal_train_test_split, weighted_rmse_score, make_skill_feval
+from src.preprocessing import (
     FEATURE_COLS,
     TYPE_C_FEATURES,
     ZERO_INFLATED_FEATURES,
@@ -30,6 +37,8 @@ from preprocessing import (
     temporal_impute_missing,
     create_missing_indicators,
     apply_imputation,
+    fit_min_max_bounds,
+    apply_min_max_scale,
     create_lag_features,
     create_rolling_features,
     create_aggregate_features_t1,
@@ -56,49 +65,7 @@ DEFAULT_GLOBAL_LAGS = None
 
 logger = logging.getLogger(__name__)
 
-
-def load_config(path: str) -> dict:
-    """Load config from YAML or JSON file. Returns dict with input_lags section. Uses defaults if file missing."""
-    defaults = {
-        "input_lags": {
-            "lags_max": DEFAULT_LAGS_MAX,
-            "top_k_per_feature": DEFAULT_TOP_K_PER_FEATURE,
-            "use_global_lags": DEFAULT_USE_GLOBAL_LAGS,
-            "global_lags": DEFAULT_GLOBAL_LAGS,
-        }
-    }
-    if not os.path.isfile(path):
-        return defaults
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    try:
-        if path.endswith(".yaml") or path.endswith(".yml"):
-            try:
-                import yaml
-                data = yaml.safe_load(content)
-            except ImportError:
-                raise ImportError(
-                    "YAML config requires pyyaml. Install with: pip install pyyaml. Or use .json config."
-                )
-        else:
-            data = json.loads(content)
-        if data is None:
-            return defaults
-        il = data.get("input_lags", {})
-        merged = defaults["input_lags"].copy()
-        if "lags_max" in il:
-            merged["lags_max"] = int(il["lags_max"])
-        if "top_k_per_feature" in il:
-            merged["top_k_per_feature"] = int(il["top_k_per_feature"])
-        if "use_global_lags" in il:
-            merged["use_global_lags"] = bool(il["use_global_lags"])
-        if "global_lags" in il:
-            gl = il["global_lags"]
-            merged["global_lags"] = gl if gl is None else [int(x) for x in gl]
-        return {"input_lags": merged}
-    except Exception as e:
-        logger.warning("Failed to parse config %s: %s. Using defaults.", path, e)
-        return defaults
+from src.config_loader import load_config
 
 
 def _build_train_features(
@@ -156,6 +123,14 @@ def _build_train_features(
     train_imputed, entity_encodings = encode_entity_categoricals(
         train_imputed, ENTITY_CATEGORICAL_COLS, encodings=None
     )
+
+    # Min-max scale input features when using float16 lags to avoid overflow
+    input_feature_min_max = {}
+    if use_input_lags and use_float16_when_large:
+        scale_cols = [c for c in FEATURE_COLS if c in train_imputed.columns and pd.api.types.is_numeric_dtype(train_imputed[c])]
+        if scale_cols:
+            input_feature_min_max = fit_min_max_bounds(train_imputed, scale_cols)
+            train_imputed = apply_min_max_scale(train_imputed, input_feature_min_max)
 
     input_lag_cols = []
     lag_spec = None
@@ -218,6 +193,7 @@ def _build_train_features(
         "impute_values": impute_values,
         "indicator_cols": indicator_cols,
         "winsor_bounds": winsor_bounds,
+        "input_feature_min_max": input_feature_min_max,
         "lag_cols": lag_cols,
         "rolling_cols": rolling_cols,
         "agg_cols": agg_cols,
@@ -272,6 +248,11 @@ def _build_val_features(val_df, artifacts, train_fe=None):
     val_imputed["entity_mean"] = val_imputed["entity_mean"].fillna(global_mean)
     val_imputed = val_imputed.merge(entity_std_from_train, on=ENTITY_COLS, how="left")
     val_imputed["entity_std"] = val_imputed["entity_std"].fillna(global_std)
+
+    # Apply same input-feature min-max scaling as train (for float16 lag path)
+    input_feature_min_max = artifacts.get("input_feature_min_max", {})
+    if input_feature_min_max:
+        val_imputed = apply_min_max_scale(val_imputed, input_feature_min_max)
 
     # Input lags: compute from train+val when we have train_fe (inputs are known for val)
     if train_fe is not None and input_lag_cols and lag_spec is not None:
@@ -612,6 +593,7 @@ def prepare_dataset_for_lag_config(
     global_lags=None,
     use_float16_when_large=False,
     y_lags=None,
+    train_path=None,
 ):
     """
     Load data, build features, and extract arrays for a given lag config.
@@ -619,7 +601,12 @@ def prepare_dataset_for_lag_config(
     Returns dict with X_train, y_train, w_train, X_val, y_val_orig, w_val,
     feature_cols_final, target_transform, y_train_orig, entity_cat_feature_names.
     """
-    train_df = pd.read_parquet("train.parquet")
+    if train_path is None:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _root = os.path.dirname(_dir)
+        _data_dir = os.environ.get("DATA_DIR", "data")
+        train_path = os.path.join(_root, _data_dir, "train.parquet")
+    train_df = pd.read_parquet(train_path)
     train_part, val_df, cutoff = temporal_train_test_split(
         train_df, ts_col=TS_COL, test_size=0.2
     )
@@ -811,8 +798,7 @@ if __name__ == "__main__":
 
     config_path = args.config
     if config_path is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, "config.yaml")
+        config_path = os.path.join(_project_root, "config.yaml")
     cfg = load_config(config_path)
     il = cfg["input_lags"]
 

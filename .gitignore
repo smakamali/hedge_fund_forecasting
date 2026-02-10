@@ -1,6 +1,11 @@
 # Data files
 *.parquet
-*.csv
+data/*.parquet
+
+# Output artifacts (optional: uncomment to ignore submission CSVs and .npy)
+output/*.csv
+output/*.npy
+output/*.json
 
 # archive files
 *.tar.gz

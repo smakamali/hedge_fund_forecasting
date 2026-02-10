@@ -5,7 +5,7 @@ Implements the competition metric and validation helpers.
 
 import numpy as np
 
-from preprocessing import inverse_transform_target
+from .preprocessing import inverse_transform_target
 
 
 def _clip01(x: float) -> float:

@@ -1,40 +1,42 @@
 """
-Experiment 1: Tune global_lags for xlag-only config.
-Runs 6 configurations with use_global_lags=True and different global_lags.
+Experiment 2: Tune lags_max and top_k_per_feature for xlag-only config.
+Uses only valid combinations where top_k_per_feature <= lags_max.
 All runs logged to MLflow experiment hedge_fund_forecasting_tune_xlag.
-Usage: conda run -n forecast_fund python run_tune_input_lags_exp1.py
+Usage: from project root: python scripts/run_tune_input_lags_exp2.py
 """
 import logging
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 from run_validation_lagged_features import main
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logging.getLogger("run_validation_lagged_features").setLevel(logging.INFO)
 
-GLOBAL_LAGS_CONFIGS = [
-    [1],
-    [1, 2],
-    [1, 2, 3],
-    [1, 2, 3, 5],
-    [1, 2, 3, 5, 10],
-    [1, 2, 3, 5, 10, 15],
-]
+LAGS_MAX_VALUES = [15, 20]
+TOP_K_VALUES = [2, 3, 4, 5, 6] # 7, 10]
 
-RUN_NAMES = [
-    "xlag_gl1",
-    "xlag_gl1_2",
-    "xlag_gl1_2_3",
-    "xlag_gl1_2_3_5",
-    "xlag_gl1_2_3_5_10",
-    "xlag_gl1_2_3_5_10_15",
+CONFIGS = [
+    (lags_max, top_k)
+    for lags_max in LAGS_MAX_VALUES
+    for top_k in TOP_K_VALUES
+    if top_k <= lags_max
 ]
 
 
 def run_all():
     results = []
-    for i, (config, name) in enumerate(zip(GLOBAL_LAGS_CONFIGS, RUN_NAMES), 1):
+    for i, (lm, tk) in enumerate(CONFIGS, 1):
+        name = f"xlag_lm{lm}_tk{tk}"
         logging.info("=" * 60)
-        logging.info("Experiment 1 %d/%d: %s", i, len(GLOBAL_LAGS_CONFIGS), name)
+        logging.info("Experiment 2 %d/%d: %s", i, len(CONFIGS), name)
         logging.info("=" * 60)
         try:
             score = main(
@@ -42,8 +44,8 @@ def run_all():
                 use_target_lags=False,
                 use_rolling=False,
                 use_aggregates=False,
-                use_global_lags=True,
-                global_lags=config,
+                lags_max=lm,
+                top_k_per_feature=tk,
                 use_mlflow=True,
                 experiment_name="hedge_fund_forecasting_tune_xlag",
                 run_name=name,

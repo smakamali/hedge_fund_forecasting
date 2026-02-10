@@ -1,11 +1,20 @@
 """
-LightGBM parameter tuning for top 7 xlag configurations.
-Data generation is performed once per lag config; only LightGBM params vary.
-Tunes num_leaves, min_data_in_leaf, max_depth per LightGBM docs.
-Usage: conda run -n forecast_fund python run_tune_lgb_params.py
+Target lag tuning for xlag_gl1 config.
+Base: xlag_gl1 (global_lags=[1]) + target lags.
+Searches over y_lags configurations, each with full LightGBM param grid.
+Usage: from project root: python scripts/run_tune_target_lags.py
 """
 import itertools
 import logging
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 import mlflow
 
@@ -17,32 +26,38 @@ from run_validation_lagged_features import (
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logging.getLogger("run_validation_lagged_features").setLevel(logging.INFO)
 
-# Top 7 lag configs by val_skill from hedge_fund_forecasting_tune_xlag
-TOP_7_CONFIGS = [
-    {"run_name": "xlag_gl1", "use_global_lags": True, "global_lags": [1]},
-    {"run_name": "xlag_gl1_2", "use_global_lags": True, "global_lags": [1, 2]},
-    {"run_name": "xlag_gl1_2_3", "use_global_lags": True, "global_lags": [1, 2, 3]},
-    {"run_name": "xlag_lm10_tk2", "lags_max": 10, "top_k_per_feature": 2},
-    {"run_name": "xlag_lm15_tk3", "lags_max": 15, "top_k_per_feature": 3},
-    {"run_name": "xlag_lm10_tk5", "lags_max": 10, "top_k_per_feature": 5, "use_float16_when_large": True},
-    {"run_name": "xlag_lm10_tk3", "lags_max": 10, "top_k_per_feature": 3},
-    {"run_name": "xlag_lm5_tk3", "lags_max": 5, "top_k_per_feature": 3},
+# Target lag configs to search
+YLAG_CONFIGS = [
+    [1],
+    [1, 2],
+    [1, 2, 3],
+    [1, 2, 3, 4],
+    [1, 2, 3, 4, 5],
+    [1, 2, 3, 4, 5, 10],
 ]
 
-# Base lag params for all top 7 (xlag-only)
-BASE_LAG_PARAMS = {
+# Base: xlag_gl1 (best input lag config from tune_lgb)
+BASE_PARAMS = {
     "use_input_lags": True,
-    "use_target_lags": False,
+    "use_target_lags": True,
     "use_rolling": False,
     "use_aggregates": False,
     "use_target_transform": False,
+    "lags_max": 5,
+    "top_k_per_feature": 2,
+    "use_global_lags": True,
+    "global_lags": [1],
 }
 
-# Param grid: num_leaves, min_data_in_leaf, max_depth
-# Constraint: num_leaves <= 2^max_depth when max_depth > 0
+# LightGBM param grid (same as run_tune_lgb_params)
 NUM_LEAVES_VALUES = [15, 31, 50, 70]
 MIN_DATA_IN_LEAF_VALUES = [20, 50, 100, 200]
 MAX_DEPTH_VALUES = [5, 7, 9, -1]
+
+
+def ylag_run_name(y_lags):
+    """e.g. [1,2,3] -> ylag_1_2_3"""
+    return "ylag_" + "_".join(map(str, y_lags))
 
 
 def build_param_grid():
@@ -63,29 +78,17 @@ PARAM_GRID = build_param_grid()
 
 
 def run_all():
-    mlflow.set_experiment("hedge_fund_forecasting_tune_lgb")
+    mlflow.set_experiment("hedge_fund_forecasting_tune_y_lag")
     all_results = []
-    for i, config in enumerate(TOP_7_CONFIGS, 1):
-        run_name_base = config["run_name"]
-        lag_params = {**BASE_LAG_PARAMS}
-        if "use_global_lags" in config:
-            lag_params["use_global_lags"] = config["use_global_lags"]
-            lag_params["global_lags"] = config["global_lags"]
-            lag_params["lags_max"] = 5
-            lag_params["top_k_per_feature"] = 2
-        else:
-            lag_params["use_global_lags"] = False
-            lag_params["global_lags"] = None
-            lag_params["lags_max"] = config["lags_max"]
-            lag_params["top_k_per_feature"] = config["top_k_per_feature"]
-        if "use_float16_when_large" in config:
-            lag_params["use_float16_when_large"] = config["use_float16_when_large"]
+    for i, y_lags in enumerate(YLAG_CONFIGS, 1):
+        run_name_base = ylag_run_name(y_lags)
+        params = {**BASE_PARAMS, "y_lags": y_lags}
 
         logging.info("=" * 60)
-        logging.info("Lag config %d/7: %s (preparing data once)", i, run_name_base)
+        logging.info("Ylag config %d/%d: %s (preparing data once)", i, len(YLAG_CONFIGS), run_name_base)
         logging.info("=" * 60)
         try:
-            dataset = prepare_dataset_for_lag_config(**lag_params)
+            dataset = prepare_dataset_for_lag_config(**params)
         except (MemoryError, OSError) as e:
             logging.exception("Skipping %s: data prep failed (OOM or resource error): %s", run_name_base, e)
             continue
@@ -100,21 +103,17 @@ def run_all():
                     num_leaves=nl,
                     min_data_in_leaf=md,
                     max_depth=depth if depth > 0 else -1,
+                    use_skill_feval=False,
                 )
                 with mlflow.start_run(run_name=run_name):
                     mlflow.log_params({
-                        "use_input_lags": str(lag_params["use_input_lags"]),
-                        "use_target_lags": str(lag_params["use_target_lags"]),
-                        "use_rolling": str(lag_params["use_rolling"]),
-                        "use_aggregates": str(lag_params["use_aggregates"]),
-                        "lags_max": str(lag_params["lags_max"]),
-                        "top_k_per_feature": str(lag_params["top_k_per_feature"]),
-                        "use_global_lags": str(lag_params["use_global_lags"]),
-                        "global_lags": (
-                            ",".join(map(str, lag_params["global_lags"]))
-                            if lag_params.get("global_lags") else "null"
-                        ),
-                        "use_float16_when_large": str(lag_params.get("use_float16_when_large", False)),
+                        "use_input_lags": str(params["use_input_lags"]),
+                        "use_target_lags": str(params["use_target_lags"]),
+                        "y_lags": ",".join(map(str, y_lags)),
+                        "use_rolling": str(params["use_rolling"]),
+                        "use_aggregates": str(params["use_aggregates"]),
+                        "use_global_lags": str(params["use_global_lags"]),
+                        "global_lags": ",".join(map(str, params["global_lags"])),
                         "num_leaves": str(nl),
                         "min_data_in_leaf": str(md),
                         "max_depth": str(depth) if depth > 0 else "-1",
@@ -143,8 +142,8 @@ def run_all():
     logging.info("=" * 60)
     logging.info("SUMMARY")
     logging.info("=" * 60)
-    for lag_name, best_run, skill in all_results:
-        logging.info("  %s: %s (val_skill=%.6f)", lag_name, best_run, skill)
+    for ylag_name, best_run, skill in all_results:
+        logging.info("  %s: %s (val_skill=%.6f)", ylag_name, best_run, skill)
     overall = max(all_results, key=lambda x: x[2], default=None)
     if overall:
         logging.info("Overall best: %s / %s (val_skill=%.6f)", overall[0], overall[1], overall[2])

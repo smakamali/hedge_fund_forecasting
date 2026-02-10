@@ -137,6 +137,37 @@ def apply_imputation(df: pd.DataFrame, impute_values: Dict[str, float]) -> pd.Da
     return df_out
 
 
+def fit_min_max_bounds(df: pd.DataFrame, columns: List[str]) -> Dict[str, Tuple[float, float]]:
+    """Compute min/max per column for min-max scaling. Returns {col: (min_val, max_val)}."""
+    bounds: Dict[str, Tuple[float, float]] = {}
+    for col in columns:
+        if col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        mn = float(df[col].min())
+        mx = float(df[col].max())
+        if mx <= mn:
+            mx = mn + 1.0  # avoid div by zero
+        bounds[col] = (mn, mx)
+    return bounds
+
+
+def apply_min_max_scale(
+    df: pd.DataFrame, bounds: Dict[str, Tuple[float, float]], clip: bool = True
+) -> pd.DataFrame:
+    """Scale columns to [0, 1] using pre-computed bounds. Returns a copy with scaled columns."""
+    df_out = df.copy(deep=False)
+    for col, (lo, hi) in bounds.items():
+        if col not in df_out.columns:
+            continue
+        scale = hi - lo
+        if scale <= 0:
+            scale = 1.0
+        df_out[col] = ((df_out[col].astype(float) - lo) / scale)
+        if clip:
+            df_out[col] = df_out[col].clip(0.0, 1.0)
+    return df_out
+
+
 def create_missing_indicators(df: pd.DataFrame, feature_cols: List[str], missing_threshold: float = 0.01) -> tuple:
     """Create binary is_missing columns for features with missing rate > threshold. Returns (df, indicator_cols)."""
     indicator_cols = []

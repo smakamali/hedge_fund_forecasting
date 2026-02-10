@@ -4,11 +4,21 @@
 - hedge_fund_forecasting_tune_lgb: LightGBM param tuning per TOP_7_CONFIGS
 - hedge_fund_forecasting_tune_y_lag: target lag tuning for xlag_gl1 + LGB params
 
-Usage:
-  python review_mlflow_results.py           # all sections
-  python review_mlflow_results.py --ylag-only   # only tune_y_lag (avoids listing experiments)
+Usage (from project root):
+  python scripts/review_mlflow_results.py           # all sections
+  python scripts/review_mlflow_results.py --ylag-only   # only tune_y_lag (avoids listing experiments)
 """
 import argparse
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 import mlflow
 import pandas as pd
 

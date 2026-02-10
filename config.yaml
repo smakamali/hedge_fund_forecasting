@@ -1,7 +1,33 @@
-# Input lag configuration for run_validation_lagged_features.py
-# Used when running the script directly (not by experiment scripts).
+# Input lag configuration for run_validation_lagged_features.py and submission pipeline.
 input_lags:
   lags_max: 5
   top_k_per_feature: 2
   use_global_lags: True
   global_lags: [1]   # null for no global lags
+  use_float16_when_large: true
+
+# Target-derived features (y_target lags, rolling, aggregates).
+target_lags:
+  use_target_lags: true
+  y_lags: [1]
+  use_rolling: false
+  use_aggregates: false
+  use_target_transform: false
+
+# LightGBM training parameters (used by validation and submission pipeline).
+lightgbm:
+  num_leaves: 70
+  min_data_in_leaf: 100
+  max_depth: 7
+  learning_rate: 0.1
+  feature_fraction: 1.0
+  bagging_fraction: 1.0
+  bagging_freq: 0
+  lambda_l1: 0.0
+  lambda_l2: 0.0
+  seed: 42
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+
+# Data directory (relative to project root). train.parquet and test.parquet go here.
+data_dir: data

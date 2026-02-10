@@ -1,9 +1,19 @@
-"""Run Phase 3 LightGBM pipeline (for conda env)."""
+"""Run Phase 3 LightGBM pipeline. Run from project root: python scripts/run_phase3.py"""
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from evaluation import temporal_train_test_split, evaluate_predictions
-from preprocessing import (
+from src.evaluation import temporal_train_test_split, evaluate_predictions
+from src.preprocessing import (
     FEATURE_COLS, TYPE_C_FEATURES, ZERO_INFLATED_FEATURES,
     temporal_impute_missing, create_missing_indicators, apply_imputation,
     create_lag_features, create_rolling_features, create_aggregate_features_t1, create_entity_count,
@@ -14,7 +24,9 @@ ENTITY_COLS = ['code', 'sub_code', 'sub_category', 'horizon']
 TS_COL = 'ts_index'
 TARGET_COL = 'y_target'
 
-df = pd.read_parquet('train.parquet')
+_data_dir = os.environ.get("DATA_DIR", "data")
+train_path = os.path.join(_project_root, _data_dir, "train.parquet")
+df = pd.read_parquet(train_path)
 train_df, val_df, cutoff = temporal_train_test_split(df, ts_col=TS_COL, test_size=0.2)
 train_imputed, impute_values = temporal_impute_missing(train_df, FEATURE_COLS, method='median')
 val_imputed = apply_imputation(val_df, impute_values)

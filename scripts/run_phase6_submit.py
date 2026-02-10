@@ -1,14 +1,24 @@
 """
 Phase 6: Train on full data, build test features (no y_target), predict and save final_submission.csv.
-Run: conda run -n forecast_fund python run_phase6_submit.py
+Run: from project root: python scripts/run_phase6_submit.py
 Optional: --target-transform to enable target transformation (default is no transform).
 """
 import argparse
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from evaluation import evaluate_predictions
-from preprocessing import (
+from src.evaluation import evaluate_predictions
+from src.preprocessing import (
     FEATURE_COLS, TYPE_C_FEATURES, ZERO_INFLATED_FEATURES,
     ENTITY_CATEGORICAL_COLS, encode_entity_categoricals,
     fit_target_transform, transform_target, inverse_transform_target,
@@ -40,6 +50,7 @@ def build_train_features(train_df, use_target_transform=False):
     else:
         target_transform = None
 
+    train_imputed, lag_cols = create_lag_features(train_imputed, ENTITY_COLS, TARGET_COL, TS_COL, lags=LAGS)
     train_imputed, rolling_cols = create_rolling_features(train_imputed, ENTITY_COLS, TARGET_COL, TS_COL, windows=WINDOWS)
     train_imputed, agg_cols = create_aggregate_features_t1(train_imputed, TARGET_COL, TS_COL, group_col='sub_category')
     train_imputed, entity_count_col = create_entity_count(train_imputed, ENTITY_COLS, TS_COL)
@@ -175,8 +186,10 @@ def main():
     args = parser.parse_args()
     use_target_transform = args.target_transform
 
+    _data_dir = os.environ.get("DATA_DIR", "data")
+    train_path = os.path.join(_project_root, _data_dir, "train.parquet")
     print("Loading train...")
-    train_df = pd.read_parquet('train.parquet')
+    train_df = pd.read_parquet(train_path)
     print("Building train features (target_transform=%s)..." % use_target_transform)
     train_fe, all_feature_cols, artifacts = build_train_features(train_df, use_target_transform=use_target_transform)
 
@@ -199,8 +212,9 @@ def main():
     print("Training final model on full train...")
     model = lgb.train(params, train_data, num_boost_round=500, callbacks=[lgb.log_evaluation(100)])
 
+    test_path = os.path.join(_project_root, _data_dir, "test.parquet")
     print("Loading test...")
-    test_df = pd.read_parquet('test.parquet')
+    test_df = pd.read_parquet(test_path)
     print("Building test features...")
     test_fe = build_test_features(test_df, artifacts)
 
@@ -216,8 +230,11 @@ def main():
     else:
         pred = pred_t
     out = pd.DataFrame({'id': test_df['id'].values, 'prediction': pred})
-    out.to_csv('final_submission.csv', index=False)
-    print("Saved final_submission.csv with", len(out), "rows.")
+    out_dir = os.path.join(_project_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "final_submission.csv")
+    out.to_csv(out_path, index=False)
+    print("Saved", out_path, "with", len(out), "rows.")
     assert out['prediction'].notna().all(), "NaN in predictions"
     assert out['id'].notna().all(), "NaN in id"
 

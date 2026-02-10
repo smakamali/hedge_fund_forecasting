@@ -1,9 +1,18 @@
 """
 Run validation experiments with different feature-flag combinations sequentially.
 Each run is tracked as a separate MLflow experiment run.
-Usage: conda run -n forecast_fund python run_experiments.py
+Usage: from project root: python scripts/run_experiments.py
 """
 import logging
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 from run_validation_lagged_features import main
 

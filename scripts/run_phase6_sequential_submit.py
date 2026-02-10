@@ -1,10 +1,20 @@
 """
 Phase 6 (sequential): Train on full data, then run sequential inference on test:
-at each ts_index T, build lag/rolling/aggregate features from train y_target + 
+at each ts_index T, build lag/rolling/aggregate features from train y_target +
 previous test predictions, predict, then update state.
-Writes final_submission_sequential.csv. Reference: run_phase6_submit.py (unchanged).
-Run: conda run -n forecast_fund python run_phase6_sequential_submit.py
+Writes output/final_submission_sequential.csv.
+Run: from project root: python scripts/run_phase6_sequential_submit.py
 """
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
@@ -16,7 +26,7 @@ from run_phase6_submit import (
     LAGS,
     WINDOWS,
 )
-from preprocessing import (
+from src.preprocessing import (
     FEATURE_COLS,
     TYPE_C_FEATURES,
     ZERO_INFLATED_FEATURES,
@@ -150,8 +160,10 @@ def compute_block_temporal_features(
 
 
 def main():
+    _data_dir = os.environ.get("DATA_DIR", "data")
+    train_path = os.path.join(_project_root, _data_dir, "train.parquet")
     print("Loading train...")
-    train_df = pd.read_parquet("train.parquet")
+    train_df = pd.read_parquet(train_path)
     print("Building train features...")
     train_fe, all_feature_cols, artifacts = build_train_features(train_df)
 
@@ -195,8 +207,9 @@ def main():
         subcat_mean_fallback,
     ) = precompute_train_state(train_df)
 
+    test_path = os.path.join(_project_root, _data_dir, "test.parquet")
     print("Loading test...")
-    test_df = pd.read_parquet("test.parquet")
+    test_df = pd.read_parquet(test_path)
 
     test_base = apply_imputation(test_df, artifacts["impute_values"])
     test_base, _ = create_missing_indicators(
@@ -282,8 +295,11 @@ def main():
     pred_arr = np.array(predictions, dtype=float)
     assert np.isfinite(pred_arr).all(), "NaN or Inf in predictions"
     out = pd.DataFrame({"id": id_order, "prediction": pred_arr})
-    out.to_csv("final_submission_sequential.csv", index=False)
-    print("Saved final_submission_sequential.csv with", len(out), "rows.")
+    out_dir = os.path.join(_project_root, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "final_submission_sequential.csv")
+    out.to_csv(out_path, index=False)
+    print("Saved", out_path, "with", len(out), "rows.")
 
 
 if __name__ == "__main__":

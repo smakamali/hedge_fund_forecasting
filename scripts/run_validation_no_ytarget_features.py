@@ -2,13 +2,23 @@
 Validation experiment: train and evaluate WITHOUT any features derived from y_target.
 No lags, no rolling, no global/sub_category mean, no horizon_x_subcat.
 Only: 86 features + indicators + zero flags + winsorize + log Type C + horizon_numeric.
-Run: conda run -n forecast_fund python run_validation_no_ytarget_features.py
+Run: from project root: python scripts/run_validation_no_ytarget_features.py
 """
+import os
+import sys
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from evaluation import temporal_train_test_split, weighted_rmse_score
-from preprocessing import (
+from src.evaluation import temporal_train_test_split, weighted_rmse_score
+from src.preprocessing import (
     FEATURE_COLS,
     TYPE_C_FEATURES,
     ZERO_INFLATED_FEATURES,
@@ -74,8 +84,10 @@ def build_val_features_no_ytarget(val_df, artifacts):
 
 
 def main():
+    _data_dir = os.environ.get("DATA_DIR", "data")
+    train_path = os.path.join(_project_root, _data_dir, "train.parquet")
     print("Loading train...")
-    train_df = pd.read_parquet("train.parquet")
+    train_df = pd.read_parquet(train_path)
     train_part, val_df, cutoff = temporal_train_test_split(
         train_df, ts_col=TS_COL, test_size=0.2
     )
