@@ -179,11 +179,17 @@ python scripts/run_validation_lagged_features.py --config config.yaml --no-mlflo
 ## Outputs and MLflow
 
 - **output/**  
-  - `submission_v1_<timestamp>.csv`, `submission_v2_<timestamp>.csv`, `submission_v3_<timestamp>.csv` — submission files.  
+  - `submission_v*_<timestamp>.csv` — submission files.  
   - `submission_v*_<timestamp>_metadata.json` — metrics and config used for that run.  
   - `validation_errors.npy`, `validation_errors_transformed.npy` (and timestamped copies) — produced by Step 1 for Step 2.
 
 - **MLflow:** If you pass `--experiment NAME`, each pipeline step logs params, metrics, and artifacts (metadata + submission CSV) to MLflow. Use `review_mlflow_results.py` to inspect runs.
+
+  **Start the MLflow tracking server** (from project root, then open http://localhost:5000):
+
+  ```bash
+  mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlruns --host 0.0.0.0 --port 5000
+  ```
 
 ---
 

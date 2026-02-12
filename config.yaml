@@ -16,9 +16,9 @@ target_lags:
 
 # LightGBM training parameters (used by validation and submission pipeline).
 lightgbm:
-  num_leaves: 70
-  min_data_in_leaf: 100
-  max_depth: 7
+  num_leaves: 50
+  min_data_in_leaf: 200
+  max_depth: -1
   learning_rate: 0.1
   feature_fraction: 1.0
   bagging_fraction: 1.0
