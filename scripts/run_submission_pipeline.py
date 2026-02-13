@@ -1,7 +1,28 @@
 """
-Three-step submission pipeline: v1 (Model A sequential), v2 (noise-robust A2), v3 (Model B + A').
-Run from project root: python scripts/run_submission_pipeline.py [--step 1|2|3|all] [--config path] [--experiment NAME]
-Requires data/train.parquet and data/test.parquet. Writes to output/. Logs metadata and MLflow runs when --experiment is set.
+Three-step submission pipeline for hedge fund forecasting.
+
+This pipeline generates three submission versions:
+- v1 (Model A sequential): Trains Model A with target lags/rolling/aggregates, performs sequential validation
+  to compute errors, then generates test predictions.
+- v2 (noise-robust A2): Injects validation errors as noise into training targets, trains Model A2 with
+  noisy target-derived features for robustness.
+- v3 (Model B + A'): Trains Model B (base + input lags only), uses its OOF predictions as pseudo-targets
+  for Model A' (with target-derived features), then combines for final predictions.
+
+Inputs:
+- data/train.parquet: Training data
+- data/test.parquet: Test data
+- config.yaml: Configuration with input_lags, target_lags, lightgbm parameters
+
+Outputs:
+- output/submission_v{1,2,3}_{timestamp}.csv: Submission files
+- output/submission_v{1,2,3}_{timestamp}_metadata.json: Metadata files
+- output/validation_errors*.npy: Validation errors from step 1 (used by step 2)
+
+Usage:
+    python scripts/run_submission_pipeline.py [--step 1|2|3|all] [--config path] [--experiment NAME]
+
+When --experiment is set, logs metadata and artifacts to MLflow for each step.
 """
 import argparse
 import contextlib
@@ -55,8 +76,6 @@ from src.preprocessing import (
 from run_validation_lagged_features import (
     _build_train_features,
     _build_val_features,
-    prepare_dataset_for_lag_config,
-    train_and_evaluate,
     ENTITY_COLS,
     ENTITY_CAT_FEATURE_NAMES,
     TS_COL,
@@ -70,14 +89,52 @@ from run_validation_lagged_features import (
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+# Paths
+DEFAULT_DATA_DIR = "data"
+OUTPUT_DIR_NAME = "output"
+DEFAULT_CONFIG_FILENAME = "config.yaml"
+
+# Splits and thresholds
+VALIDATION_TEST_SIZE = 0.1
+TEMPORAL_TRAIN_FRACTION = 0.9
+MISSING_FEATURE_THRESHOLD = 0.01
+WINSORIZE_QUANTILES = (0.01, 0.99)
+
+# LightGBM defaults
+DEFAULT_NUM_BOOST_ROUND = 1000
+DEFAULT_NUM_BOOST_ROUND_MODEL_B = 500
+DEFAULT_EARLY_STOPPING_ROUNDS = 50
+DEFAULT_SEED = 42
+
+# Logging intervals
+LOG_EVAL_VERBOSE_INTERVAL = 50
+LOG_EVAL_QUIET_INTERVAL = 0
+LOG_EVAL_FULL_INTERVAL = 100
+
+# Output files
+VALIDATION_ERRORS_FILENAME = "validation_errors.npy"
+VALIDATION_ERRORS_TRANSFORMED_FILENAME = "validation_errors_transformed.npy"
+VALIDATION_ERRORS_ENTITY_FILENAME = "validation_errors_with_entity.parquet"
+SUBMISSION_FILENAME_PREFIX = "submission_v{step}"
+METADATA_SUFFIX = "_metadata.json"
+TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+
+# Misc
+MISSING_FEATURES_WARN_LIMIT = 10
+
+# -----------------------------------------------------------------------------
 # Paths and config
 # -----------------------------------------------------------------------------
 
 def _get_paths(cfg):
-    data_dir = cfg.get("data_dir", "data")
+    """Get paths for train, test, output directories from config."""
+    data_dir = cfg.get("data_dir", DEFAULT_DATA_DIR)
     if not os.path.isabs(data_dir):
         data_dir = os.path.join(_project_root, data_dir)
-    out_dir = os.path.join(_project_root, "output")
+    out_dir = os.path.join(_project_root, OUTPUT_DIR_NAME)
     train_path = os.path.join(data_dir, "train.parquet")
     test_path = os.path.join(data_dir, "test.parquet")
     return {"train_path": train_path, "test_path": test_path, "out_dir": out_dir, "data_dir": data_dir}
@@ -98,24 +155,125 @@ def _build_metadata(step_name, metrics, cfg):
 
 
 def _metadata_path_for_submission(submission_path):
-    """e.g. output/submission_v1.csv -> output/submission_v1_metadata.json"""
+    """Get metadata path for a submission file. e.g. output/submission_v1.csv -> output/submission_v1_metadata.json"""
     base, _ = os.path.splitext(submission_path)
-    return base + "_metadata.json"
+    return base + METADATA_SUFFIX
+
+
+def _submission_output_path(out_dir, step_number):
+    """Generate timestamped submission output path for a step. Returns path like output/submission_v{step}_{timestamp}.csv"""
+    ts = datetime.now().strftime(TIMESTAMP_FORMAT)
+    filename = f"submission_v{step_number}_{ts}.csv"
+    return os.path.join(out_dir, filename)
+
+
+def _build_lgb_params(lb, include_max_depth=True):
+    """Build LightGBM parameters dict from config. Returns dict with objective, metric, boosting_type, num_leaves, etc."""
+    params = {
+        "objective": "regression",
+        "metric": "None",
+        "boosting_type": "gbdt",
+        "num_leaves": lb["num_leaves"],
+        "min_data_in_leaf": lb["min_data_in_leaf"],
+        "learning_rate": lb["learning_rate"],
+        "verbose": -1,
+        "seed": lb.get("seed", DEFAULT_SEED),
+    }
+    if include_max_depth and lb.get("max_depth", -1) > 0:
+        params["max_depth"] = lb["max_depth"]
+    return params
+
+
+def _temporal_train_val_split(df, ts_col, train_fraction=TEMPORAL_TRAIN_FRACTION):
+    """
+    Split dataframe temporally by ts_col. Returns (mask_train, mask_val) for use with df.loc[mask_train].
+    
+    Args:
+        df: DataFrame with ts_col column
+        ts_col: Name of timestamp column
+        train_fraction: Fraction of unique timestamps to use for training (default 0.9)
+    
+    Returns:
+        (mask_train, mask_val): Boolean masks for training and validation sets
+    """
+    unique_ts = sorted(df[ts_col].unique())
+    split_idx = int(len(unique_ts) * train_fraction)
+    cutoff = unique_ts[split_idx]
+    mask_train = df[ts_col].values <= cutoff
+    mask_val = ~mask_train
+    return mask_train, mask_val
+
+
+def _entity_stats_from_train_slice(df, mask_train, entity_cols, target_col, global_std):
+    """
+    Compute entity-level statistics (mean, std) from training slice. Used to avoid validation leakage.
+    
+    Args:
+        df: Full DataFrame
+        mask_train: Boolean mask for training rows
+        entity_cols: List of entity column names
+        target_col: Target column name
+        global_std: Global std for filling missing entity stds
+    
+    Returns:
+        (entity_mean_from_train, entity_std_from_train): DataFrames with entity statistics
+    """
+    entity_mean_from_train = df.loc[mask_train].groupby(entity_cols)[target_col].mean().reset_index(name="entity_mean")
+    entity_std_from_train = df.loc[mask_train].groupby(entity_cols)[target_col].std().reset_index(name="entity_std")
+    entity_std_from_train["entity_std"] = entity_std_from_train["entity_std"].fillna(global_std)
+    return entity_mean_from_train, entity_std_from_train
+
+
+def _alias_rolling_to_target_cols(df, raw_rolling_cols, target_col):
+    """
+    Create aliases for rolling columns to match y_target_* naming convention.
+    Maps columns like y_noisy_rolling_mean_5 to y_target_rolling_mean_5.
+    
+    Args:
+        df: DataFrame with raw rolling columns
+        raw_rolling_cols: List of raw rolling column names (e.g., y_noisy_rolling_mean_5)
+        target_col: Target column name (TARGET_COL, typically "y_target")
+    
+    Returns:
+        List of aliased column names (y_target_rolling_*)
+    """
+    rolling_cols = []
+    for c in raw_rolling_cols:
+        if "_rolling_mean_" in c:
+            suffix = c.split("_rolling_mean_", 1)[1]
+            new_name = f"{target_col}_rolling_mean_{suffix}"
+        elif "_rolling_std_" in c:
+            suffix = c.split("_rolling_std_", 1)[1]
+            new_name = f"{target_col}_rolling_std_{suffix}"
+        else:
+            # Fallback: keep original name if it does not match the expected pattern.
+            new_name = c
+        df[new_name] = df[c]
+        rolling_cols.append(new_name)
+    return rolling_cols
 
 
 def _write_metadata(metadata, submission_path, out_dir):
     """Write metadata JSON next to submission CSV (same base name + _metadata.json)."""
-    dir_part = os.path.dirname(submission_path) or out_dir
-    base = os.path.splitext(os.path.basename(submission_path))[0]
-    meta_path = os.path.join(dir_part, base + "_metadata.json")
+    meta_path = _metadata_path_for_submission(submission_path)
+    # If submission_path is relative, use out_dir as base
+    if not os.path.isabs(submission_path):
+        dir_part = os.path.dirname(submission_path) or out_dir
+        base = os.path.splitext(os.path.basename(submission_path))[0]
+        meta_path = os.path.join(dir_part, base + METADATA_SUFFIX)
     os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    logger.info("Saved metadata to %s", meta_path)
+    try:
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info("Saved metadata to %s", meta_path)
+    except (OSError, json.JSONEncodeError) as e:
+        logger.error("Failed to write metadata to %s: %s", meta_path, e)
+        raise
     return meta_path
 
 
 def _to_param(val):
+    """Convert list/dict values to JSON string for MLflow logging."""
     if isinstance(val, (list, dict)):
         return json.dumps(val)
     return val
@@ -132,9 +290,12 @@ def _log_params_and_artifacts(metadata, submission_path, out_dir):
     for key, val in metadata.get("metrics", {}).items():
         if isinstance(val, (int, float)):
             mlflow.log_metric(key, float(val))
-    dir_part = os.path.dirname(submission_path) or out_dir
-    base = os.path.splitext(os.path.basename(submission_path))[0]
-    meta_path = os.path.join(dir_part, base + "_metadata.json")
+    # Use same metadata path helper as _write_metadata
+    meta_path = _metadata_path_for_submission(submission_path)
+    if not os.path.isabs(submission_path):
+        dir_part = os.path.dirname(submission_path) or out_dir
+        base = os.path.splitext(os.path.basename(submission_path))[0]
+        meta_path = os.path.join(dir_part, base + METADATA_SUFFIX)
     if os.path.isfile(meta_path):
         mlflow.log_artifact(meta_path)
     if os.path.isfile(submission_path):
@@ -156,6 +317,7 @@ def _mlflow_run(experiment_name, run_name):
 
 
 def _entity_tuple(row):
+    """Extract entity tuple (code, sub_code, sub_category) from row."""
     return tuple(row[c] for c in ENTITY_COLS)
 
 
@@ -170,7 +332,7 @@ def _max_lag_from_spec(lag_spec):
 
 @lru_cache(maxsize=2)
 def _load_parquet_cached(path):
-    """Cached parquet loader to avoid re-reading large train/test files from disk."""
+    """Cached parquet loader to avoid re-reading large train/test files from disk. maxsize=2 for train + test paths."""
     return pd.read_parquet(path)
 
 
@@ -183,13 +345,14 @@ def _warn_and_fill_missing_features(df, feature_cols, critical_features=None, pr
     if missing_features:
         msg_prefix = f"{prefix}: " if prefix else ""
         logger.warning(
-            "%sWARNING: %d features missing in data; filling with 0.0. First up to 10: %s",
+            "%sWARNING: %d features missing in data; filling with 0.0. First up to %d: %s",
             msg_prefix,
             len(missing_features),
-            missing_features[:10],
+            MISSING_FEATURES_WARN_LIMIT,
+            missing_features[:MISSING_FEATURES_WARN_LIMIT],
         )
-        if len(missing_features) > 10:
-            logger.warning("%s... and %d more", msg_prefix, len(missing_features) - 10)
+        if len(missing_features) > MISSING_FEATURES_WARN_LIMIT:
+            logger.warning("%s... and %d more", msg_prefix, len(missing_features) - MISSING_FEATURES_WARN_LIMIT)
         for c in missing_features:
             df[c] = 0.0
     if critical_features:
@@ -235,7 +398,7 @@ def _compute_block_temporal_features(block, entity_history, running_global_sum, 
                                      running_subcat_sum, running_subcat_count,
                                      T, lag_cols, y_lags, rolling_cols, windows,
                                      global_mean_fallback, subcat_mean_fallback, entity_count_col):
-    """Target-derived features for rows at ts_index T from current state."""
+    """Target-derived features for rows at ts_index T from current state. Uses only past data (t < T) to avoid leakage."""
     n = len(block)
     out = {}
     for lag, col in zip(y_lags, lag_cols):
@@ -293,7 +456,8 @@ def _sequential_predict(df, train_fe, model, artifacts, feature_cols_final, targ
         train_fe[ENTITY_COLS + [TS_COL] + [TARGET_COL]].copy()
     )
 
-    # Base + input_lag for df: combine train tail (last max_lag rows per entity) with df to reduce memory
+    # Base + input_lag for df: combine train tail (last max_lag rows per entity) with df to reduce memory.
+    # This avoids loading full train history while still computing input lags correctly.
     max_lag = _max_lag_from_spec(lag_spec)
     train_base = train_fe.groupby(ENTITY_COLS, group_keys=False).tail(max_lag)[ENTITY_COLS + [TS_COL] + FEATURE_COLS].copy()
     train_base["_ord"] = -1
@@ -329,7 +493,7 @@ def _sequential_predict(df, train_fe, model, artifacts, feature_cols_final, targ
     global_std = artifacts["global_std"]
 
     df_work = apply_imputation(df_base_with_lags, impute_values)
-    missing_threshold = artifacts.get("missing_threshold", 0.01)
+    missing_threshold = artifacts.get("missing_threshold", MISSING_FEATURE_THRESHOLD)
     df_work, _ = create_missing_indicators(df_work, FEATURE_COLS, missing_threshold=missing_threshold)
     df_work = apply_winsorize_bounds(df_work, winsor_bounds)
     type_c_present = [c for c in TYPE_C_FEATURES if c in df_work.columns]
@@ -377,6 +541,7 @@ def _sequential_predict(df, train_fe, model, artifacts, feature_cols_final, targ
             predictions[idx_counter] = pred[j]
             idx_counter += 1
 
+        # Update state for next timestep: add predictions to entity history and update running statistics
         for j, idx in enumerate(block_df.index):
             ent = _entity_tuple(block_df.loc[idx])
             if ent not in entity_history:
@@ -408,8 +573,12 @@ def _write_submission(test_df, pred, out_path, id_col="id"):
         ).values
     out = pd.DataFrame({"id": ids, "prediction": pred})
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    out.to_csv(out_path, index=False)
-    logger.info("Saved %s with %d rows.", out_path, len(out))
+    try:
+        out.to_csv(out_path, index=False)
+        logger.info("Saved %s with %d rows.", out_path, len(out))
+    except OSError as e:
+        logger.error("Failed to write submission to %s: %s", out_path, e)
+        raise
     return out_path
 
 
@@ -418,10 +587,20 @@ def _write_submission(test_df, pred, out_path, id_col="id"):
 # -----------------------------------------------------------------------------
 
 def _run_step1(cfg, paths, experiment_name=None):
+    """
+    Step 1: Train Model A with sequential validation and generate submission v1.
+    
+    - Loads train data and performs 90/10 temporal split
+    - Builds features with target lags/rolling/aggregates
+    - Trains Model A on 90% split with early stopping
+    - Performs sequential validation prediction to compute errors
+    - Saves validation errors (original and transformed) for step 2
+    - Trains Model A on full train data
+    - Generates sequential test predictions and writes submission_v1
+    """
     train_path = paths["train_path"]
     test_path = paths["test_path"]
     out_dir = paths["out_dir"]
-    data_dir = paths.get("data_dir", os.path.join(_project_root, "data"))
 
     il = cfg["input_lags"]
     tl = cfg["target_lags"]
@@ -430,7 +609,8 @@ def _run_step1(cfg, paths, experiment_name=None):
     with _mlflow_run(experiment_name, "step1"):
         logger.info("Step 1: loading train data from %s", train_path)
         train_df = _load_parquet_cached(train_path).copy()
-        train_part, val_df, _ = temporal_train_test_split(train_df, ts_col=TS_COL, test_size=0.1)
+        # Use 90/10 temporal split to avoid leakage and match validation setup
+        train_part, val_df, _ = temporal_train_test_split(train_df, ts_col=TS_COL, test_size=VALIDATION_TEST_SIZE)
 
         train_fe, all_feature_cols, artifacts = _build_train_features(
             train_part,
@@ -446,7 +626,7 @@ def _run_step1(cfg, paths, experiment_name=None):
             y_lags=tl.get("y_lags", Y_LAGS),
             use_float16_when_large=il.get("use_float16_when_large", False),
         )
-        artifacts["missing_threshold"] = 0.01
+        artifacts["missing_threshold"] = MISSING_FEATURE_THRESHOLD
         feature_cols_final = all_feature_cols
 
         X_train = train_fe[feature_cols_final].fillna(0).to_numpy()
@@ -465,27 +645,21 @@ def _run_step1(cfg, paths, experiment_name=None):
         y_val_orig = val_df[TARGET_COL].to_numpy()
         w_val = val_df["weight"].to_numpy()
 
-        params = {
-            "objective": "regression", "metric": "None", "boosting_type": "gbdt",
-            "num_leaves": lb["num_leaves"], "min_data_in_leaf": lb["min_data_in_leaf"],
-            "learning_rate": lb["learning_rate"], "verbose": -1, "seed": lb["seed"],
-        }
-        if lb.get("max_depth", -1) > 0:
-            params["max_depth"] = lb["max_depth"]
+        params = _build_lgb_params(lb, include_max_depth=True)
         train_data = lgb.Dataset(X_train, label=y_train, weight=w_train, feature_name=feature_cols_final, categorical_feature=entity_cat)
         y_val_model = transform_target(y_val_orig, target_transform) if target_transform else y_val_orig
         val_data = lgb.Dataset(X_val, label=y_val_model, weight=w_val, reference=train_data)
         feval = make_skill_feval(y_val_orig, w_val, target_transform)
         logger.info("Step 1: training Model A with 90/10 split")
-        model_a_80 = lgb.train(
+        model_a_val = lgb.train(
             params, train_data,
-            num_boost_round=lb.get("num_boost_round", 1000),
+            num_boost_round=lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND),
             valid_sets=[val_data], valid_names=["val"], feval=feval,
-            callbacks=[lgb.log_evaluation(0), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", 50), verbose=False)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_QUIET_INTERVAL), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", DEFAULT_EARLY_STOPPING_ROUNDS), verbose=False)],
         )
 
-        # Train/val metrics (in original space)
-        pred_train_t = model_a_80.predict(X_train)
+        # Train/val metrics (in original space - inverse transform for reporting in original target space)
+        pred_train_t = model_a_val.predict(X_train)
         pred_train_orig = inverse_transform_target(pred_train_t, target_transform) if target_transform else pred_train_t
         y_train_orig = inverse_transform_target(y_train, target_transform) if target_transform else train_fe[TARGET_COL].to_numpy()
         train_skill = weighted_rmse_score(y_train_orig, pred_train_orig, w_train)
@@ -494,7 +668,7 @@ def _run_step1(cfg, paths, experiment_name=None):
         # Sequential prediction on val to get errors
         val_df_sorted = val_df.sort_values(ENTITY_COLS + [TS_COL]).reset_index(drop=True)
         logger.info("Step 1: sequential validation prediction to compute errors")
-        pred_val = _sequential_predict(val_df_sorted, train_fe, model_a_80, artifacts, feature_cols_final, target_transform)
+        pred_val = _sequential_predict(val_df_sorted, train_fe, model_a_val, artifacts, feature_cols_final, target_transform)
         y_val = val_df_sorted[TARGET_COL].to_numpy()
         w_val_sorted = val_df_sorted["weight"].to_numpy()
         val_skill = weighted_rmse_score(y_val, pred_val, w_val_sorted)
@@ -507,9 +681,9 @@ def _run_step1(cfg, paths, experiment_name=None):
             pred_val_t = transform_target(pred_val, target_transform)
             errors_val_transformed = y_val_t - pred_val_t
         # Also persist validation errors as artifacts (with and without transform).
-        errors_path = os.path.join(out_dir, "validation_errors.npy")
-        errors_path_trans = os.path.join(out_dir, "validation_errors_transformed.npy")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        errors_path = os.path.join(out_dir, VALIDATION_ERRORS_FILENAME)
+        errors_path_trans = os.path.join(out_dir, VALIDATION_ERRORS_TRANSFORMED_FILENAME)
+        ts = datetime.now().strftime(TIMESTAMP_FORMAT)
         errors_path_ts = os.path.join(out_dir, f"validation_errors_{ts}.npy")
         errors_path_trans_ts = os.path.join(out_dir, f"validation_errors_transformed_{ts}.npy")
         os.makedirs(out_dir, exist_ok=True)
@@ -522,7 +696,7 @@ def _run_step1(cfg, paths, experiment_name=None):
         val_errors_df = val_df_sorted[ENTITY_COLS].copy()
         val_errors_df["error"] = errors_val
         val_errors_df["error_transformed"] = errors_val_transformed
-        errors_entity_path = os.path.join(out_dir, "validation_errors_with_entity.parquet")
+        errors_entity_path = os.path.join(out_dir, VALIDATION_ERRORS_ENTITY_FILENAME)
         val_errors_df.to_parquet(errors_entity_path, index=False)
         logger.info(
             "Saved validation errors to %s, %s and timestamped copies %s, %s; entity-keyed to %s",
@@ -535,7 +709,7 @@ def _run_step1(cfg, paths, experiment_name=None):
         step1_metrics = {
             "train_skill": float(train_skill), "train_rmse": float(train_rmse),
             "val_skill": float(val_skill), "val_rmse": float(val_rmse),
-            "best_iteration": int(getattr(model_a_80, "best_iteration", 0) or 0),
+            "best_iteration": int(getattr(model_a_val, "best_iteration", 0) or 0),
         }
 
         # Train Model A on full train
@@ -560,10 +734,10 @@ def _run_step1(cfg, paths, experiment_name=None):
         y_train_full = train_fe_full[TARGET_COL].to_numpy()
         w_train_full = train_fe_full["weight"].to_numpy()
         train_data_full = lgb.Dataset(X_train_full, label=y_train_full, weight=w_train_full, feature_name=feature_cols_final_full, categorical_feature=entity_cat)
-        num_rounds = getattr(model_a_80, "best_iteration", None) or lb.get("num_boost_round", 1000)
+        num_rounds = getattr(model_a_val, "best_iteration", None) or lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND)
         model_a_full = lgb.train(
             params, train_data_full, num_boost_round=num_rounds,
-            callbacks=[lgb.log_evaluation(50)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_VERBOSE_INTERVAL)],
         )
 
         logger.info("Step 1: predicting on test set")
@@ -572,8 +746,7 @@ def _run_step1(cfg, paths, experiment_name=None):
         pred_test = _sequential_predict(
             test_sorted, train_fe_full, model_a_full, artifacts_full, feature_cols_final_full, artifacts_full.get("target_transform"),
         )
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out_dir, f"submission_v1_{ts}.csv")
+        out_path = _submission_output_path(out_dir, 1)
         _write_submission(test_sorted, pred_test, out_path)
         metadata = _build_metadata("step1", step1_metrics, cfg)
         _write_metadata(metadata, out_path, out_dir)
@@ -588,8 +761,8 @@ def _run_step1(cfg, paths, experiment_name=None):
 
 def _run_step2(cfg, paths, experiment_name=None):
     out_dir = paths["out_dir"]
-    errors_path = os.path.join(out_dir, "validation_errors.npy")
-    errors_path_trans = os.path.join(out_dir, "validation_errors_transformed.npy")
+    errors_path = os.path.join(out_dir, VALIDATION_ERRORS_FILENAME)
+    errors_path_trans = os.path.join(out_dir, VALIDATION_ERRORS_TRANSFORMED_FILENAME)
     if not os.path.isfile(errors_path):
         raise FileNotFoundError("Run step 1 first to generate " + errors_path)
     il = cfg["input_lags"]
@@ -602,7 +775,7 @@ def _run_step2(cfg, paths, experiment_name=None):
         logger.info("Step 2: loading train data from %s", train_path)
         train_df = _load_parquet_cached(train_path).copy()
         train_imputed, impute_values = temporal_impute_missing(train_df, FEATURE_COLS, method="median")
-        train_imputed, indicator_cols = create_missing_indicators(train_imputed, FEATURE_COLS, missing_threshold=0.01)
+        train_imputed, indicator_cols = create_missing_indicators(train_imputed, FEATURE_COLS, missing_threshold=MISSING_FEATURE_THRESHOLD)
         train_imputed = train_imputed.sort_values(ENTITY_COLS + [TS_COL])
         target_transform = fit_target_transform(train_df[TARGET_COL].to_numpy()) if tl["use_target_transform"] else None
         if target_transform:
@@ -610,8 +783,8 @@ def _run_step2(cfg, paths, experiment_name=None):
             train_imputed[TARGET_COL] = transform_target(train_imputed[TARGET_COL].to_numpy(), target_transform)
 
         # Noisy target: y_noisy = y_true + sample from errors_val (entity-conditioned when available)
-        errors_entity_path = os.path.join(out_dir, "validation_errors_with_entity.parquet")
-        np.random.seed(lb.get("seed", 42))
+        errors_entity_path = os.path.join(out_dir, VALIDATION_ERRORS_ENTITY_FILENAME)
+        np.random.seed(lb.get("seed", DEFAULT_SEED))
         if os.path.isfile(errors_entity_path):
             logger.info("Step 2: using entity-conditioned validation errors for noise")
             val_errors_df = pd.read_parquet(errors_entity_path)
@@ -649,26 +822,15 @@ def _run_step2(cfg, paths, experiment_name=None):
             train_imputed, y_col, TS_COL, group_col="sub_category"
         )
         # Alias aggregate columns to y_target_* names and use those in the feature list.
+        # This aligns feature names with validation/test block temporal features.
         train_imputed["y_target_global_mean"] = train_imputed[f"{y_col}_global_mean"]
         train_imputed["y_target_sub_category_mean"] = train_imputed[f"{y_col}_sub_category_mean"]
         agg_cols = ["y_target_global_mean", "y_target_sub_category_mean"]
         # For rolling features, create y_target_* aliases and use them as rolling_cols.
-        rolling_cols = []
-        for c in rolling_cols_raw:
-            if "_rolling_mean_" in c:
-                suffix = c.split("_rolling_mean_", 1)[1]
-                new_name = f"{TARGET_COL}_rolling_mean_{suffix}"
-            elif "_rolling_std_" in c:
-                suffix = c.split("_rolling_std_", 1)[1]
-                new_name = f"{TARGET_COL}_rolling_std_{suffix}"
-            else:
-                # Fallback: keep original name if it does not match the expected pattern.
-                new_name = c
-            train_imputed[new_name] = train_imputed[c]
-            rolling_cols.append(new_name)
+        rolling_cols = _alias_rolling_to_target_cols(train_imputed, rolling_cols_raw, TARGET_COL)
         train_imputed, entity_count_col = create_entity_count(train_imputed, ENTITY_COLS, TS_COL)
         numeric_to_clip = [c for c in FEATURE_COLS if c in train_imputed.columns]
-        train_imputed, winsor_bounds = winsorize_features(train_imputed, numeric_to_clip, quantiles=(0.01, 0.99), fit_df=train_imputed)
+        train_imputed, winsor_bounds = winsorize_features(train_imputed, numeric_to_clip, quantiles=WINSORIZE_QUANTILES, fit_df=train_imputed)
         type_c_present = [c for c in TYPE_C_FEATURES if c in train_imputed.columns]
         train_imputed = log_transform_type_c(train_imputed, type_c_present)
         train_imputed, zero_flag_cols = create_zero_inflation_flags(train_imputed, ZERO_INFLATED_FEATURES)
@@ -709,19 +871,15 @@ def _run_step2(cfg, paths, experiment_name=None):
         w_train = train_imputed["weight"].to_numpy()
         entity_cat = [c for c in ENTITY_CAT_FEATURE_NAMES if c in all_feature_cols]
 
-        # 10% temporal validation for early stopping and num_rounds
-        unique_ts = sorted(train_imputed[TS_COL].unique())
-        split_idx = int(len(unique_ts) * 0.9)
-        cutoff = unique_ts[split_idx]
-        mask_90 = train_imputed[TS_COL].values <= cutoff
-        mask_10 = ~mask_90
-        # Entity-level statistics for artifacts: compute from 90%% training slice only (avoid validation leakage).
-        entity_mean_from_train = train_imputed.loc[mask_90].groupby(ENTITY_COLS)[TARGET_COL].mean().reset_index(name="entity_mean")
-        entity_std_from_train = train_imputed.loc[mask_90].groupby(ENTITY_COLS)[TARGET_COL].std().reset_index(name="entity_std")
-        entity_std_from_train["entity_std"] = entity_std_from_train["entity_std"].fillna(global_std)
+        # 90/10 temporal validation for early stopping and num_rounds (avoid leakage)
+        mask_90, mask_10 = _temporal_train_val_split(train_imputed, TS_COL, train_fraction=TEMPORAL_TRAIN_FRACTION)
+        # Entity-level statistics for artifacts: compute from 90% training slice only (avoid validation leakage).
+        entity_mean_from_train, entity_std_from_train = _entity_stats_from_train_slice(
+            train_imputed, mask_90, ENTITY_COLS, TARGET_COL, global_std
+        )
         artifacts_a2["entity_mean_from_train"] = entity_mean_from_train
         artifacts_a2["entity_std_from_train"] = entity_std_from_train
-        artifacts_a2["missing_threshold"] = 0.01
+        artifacts_a2["missing_threshold"] = MISSING_FEATURE_THRESHOLD
         X_train_90 = train_imputed.loc[mask_90, all_feature_cols].fillna(0).to_numpy()
         y_train_90 = train_imputed.loc[mask_90, TARGET_COL].to_numpy()
         w_train_90 = train_imputed.loc[mask_90, "weight"].to_numpy()
@@ -730,24 +888,18 @@ def _run_step2(cfg, paths, experiment_name=None):
         w_val = train_imputed.loc[mask_10, "weight"].to_numpy()
         y_val_model = transform_target(y_val_orig, target_transform) if target_transform else y_val_orig
 
-        params = {
-            "objective": "regression", "metric": "None", "boosting_type": "gbdt",
-            "num_leaves": lb["num_leaves"], "min_data_in_leaf": lb["min_data_in_leaf"],
-            "learning_rate": lb["learning_rate"], "verbose": -1, "seed": lb["seed"],
-        }
-        if lb.get("max_depth", -1) > 0:
-            params["max_depth"] = lb["max_depth"]
+        params = _build_lgb_params(lb, include_max_depth=True)
         train_data_90 = lgb.Dataset(X_train_90, label=y_train_90, weight=w_train_90, feature_name=all_feature_cols, categorical_feature=entity_cat)
         val_data = lgb.Dataset(X_val, label=y_val_model, weight=w_val, reference=train_data_90)
         feval = make_skill_feval(y_val_orig, w_val, target_transform)
         logger.info("Step 2: training Model A2 with 90/10 temporal split")
         model_a2_90 = lgb.train(
             params, train_data_90,
-            num_boost_round=lb.get("num_boost_round", 1000),
+            num_boost_round=lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND),
             valid_sets=[val_data], valid_names=["val"], feval=feval,
-            callbacks=[lgb.log_evaluation(0), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", 50), verbose=False)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_QUIET_INTERVAL), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", DEFAULT_EARLY_STOPPING_ROUNDS), verbose=False)],
         )
-        num_rounds = getattr(model_a2_90, "best_iteration", None) or lb.get("num_boost_round", 1000)
+        num_rounds = getattr(model_a2_90, "best_iteration", None) or lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND)
         pred_val_t = model_a2_90.predict(X_val)
         pred_val_orig = inverse_transform_target(pred_val_t, target_transform) if target_transform else pred_val_t
         val_rmse = np.sqrt(np.mean((y_val_orig - pred_val_orig) ** 2))
@@ -758,7 +910,7 @@ def _run_step2(cfg, paths, experiment_name=None):
         logger.info("Step 2: training final Model A2 on full train")
         model_a2 = lgb.train(
             params, train_data_full, num_boost_round=num_rounds,
-            callbacks=[lgb.log_evaluation(100)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_FULL_INTERVAL)],
         )
         pred_train = model_a2.predict(X_train)
         pred_train_orig = inverse_transform_target(pred_train, target_transform) if target_transform else pred_train
@@ -774,11 +926,9 @@ def _run_step2(cfg, paths, experiment_name=None):
         logger.info("Step 2: loading test data from %s", test_path)
         test_df = _load_parquet_cached(test_path).copy()
         train_fe_for_state = train_imputed.copy()
-        train_fe_for_state = train_fe_for_state.rename(columns={})  # already has lag_cols etc.
         test_sorted = test_df.sort_values(ENTITY_COLS + [TS_COL]).reset_index(drop=True)
         pred_test = _sequential_predict(test_sorted, train_fe_for_state, model_a2, artifacts_a2, all_feature_cols, target_transform)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out_dir, f"submission_v2_{ts}.csv")
+        out_path = _submission_output_path(out_dir, 2)
         _write_submission(test_sorted, pred_test, out_path)
         metadata = _build_metadata("step2", step2_metrics, cfg)
         _write_metadata(metadata, out_path, out_dir)
@@ -792,6 +942,17 @@ def _run_step2(cfg, paths, experiment_name=None):
 # -----------------------------------------------------------------------------
 
 def _run_step3(cfg, paths, experiment_name=None):
+    """
+    Step 3: Train Model B + Model A' and generate submission v3.
+    
+    - Trains Model B (base + input lags only, no target-derived features) on 90/10 split
+    - Uses Model B_90 OOF predictions as pseudo-targets for Model A' (leak-free)
+    - Builds Model A' features with pseudo-target-derived lags/rolling/aggregates
+    - Trains Model A' on 90/10 split, then on full train
+    - Trains Model B_full on full train (for test-time prediction only)
+    - At test time: predicts with B_full, builds pseudo lags from B's predictions, then predicts with A'
+    - Writes submission_v3
+    """
     il = cfg["input_lags"]
     tl = cfg["target_lags"]
     lb = cfg["lightgbm"]
@@ -824,42 +985,32 @@ def _run_step3(cfg, paths, experiment_name=None):
         w_train_b = train_fe_b["weight"].to_numpy()
         entity_cat = [c for c in ENTITY_CAT_FEATURE_NAMES if c in feature_cols_b]
 
-        # --- Model B: 10% temporal validation for early stopping, then train on full ---
-        unique_ts_b = sorted(train_fe_b[TS_COL].unique())
-        split_idx_b = int(len(unique_ts_b) * 0.9)
-        cutoff_b = unique_ts_b[split_idx_b]
-        mask_b_90 = (train_fe_b[TS_COL].values <= cutoff_b)
-        mask_b_10 = ~mask_b_90
+        # --- Model B: 90/10 temporal validation for early stopping (avoid leakage) ---
+        mask_b_90, mask_b_10 = _temporal_train_val_split(train_fe_b, TS_COL, train_fraction=TEMPORAL_TRAIN_FRACTION)
         X_b_90 = train_fe_b.loc[mask_b_90, feature_cols_b].fillna(0).to_numpy()
         y_b_90 = train_fe_b.loc[mask_b_90, TARGET_COL].to_numpy()
         w_b_90 = train_fe_b.loc[mask_b_90, "weight"].to_numpy()
         X_b_val = train_fe_b.loc[mask_b_10, feature_cols_b].fillna(0).to_numpy()
         y_b_val = train_fe_b.loc[mask_b_10, TARGET_COL].to_numpy()
         w_b_val = train_fe_b.loc[mask_b_10, "weight"].to_numpy()
-        params_b = {
-            "objective": "regression", "metric": "None", "boosting_type": "gbdt",
-            "num_leaves": lb["num_leaves"], "min_data_in_leaf": lb["min_data_in_leaf"],
-            "learning_rate": lb["learning_rate"], "verbose": -1, "seed": lb["seed"],
-        }
-        if lb.get("max_depth", -1) > 0:
-            params_b["max_depth"] = lb["max_depth"]
+        params_b = _build_lgb_params(lb, include_max_depth=True)
         train_data_b_90 = lgb.Dataset(X_b_90, label=y_b_90, weight=w_b_90, feature_name=feature_cols_b, categorical_feature=entity_cat)
         val_data_b = lgb.Dataset(X_b_val, label=y_b_val, weight=w_b_val, reference=train_data_b_90)
         feval_b = make_skill_feval(y_b_val, w_b_val, None)
         logger.info("Step 3: training Model B with 90/10 temporal split")
         model_b_90 = lgb.train(
             params_b, train_data_b_90,
-            num_boost_round=lb.get("num_boost_round", 500),
+            num_boost_round=lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND_MODEL_B),
             valid_sets=[val_data_b], valid_names=["val"], feval=feval_b,
-            callbacks=[lgb.log_evaluation(0), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", 50), verbose=False)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_QUIET_INTERVAL), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", DEFAULT_EARLY_STOPPING_ROUNDS), verbose=False)],
         )
-        num_rounds_b = getattr(model_b_90, "best_iteration", None) or lb.get("num_boost_round", 500)
+        num_rounds_b = getattr(model_b_90, "best_iteration", None) or lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND_MODEL_B)
         # B_90 metrics on its 90% training set only (model used for A' pseudo-target; no full-train B here)
         pred_train_b_90 = model_b_90.predict(X_b_90)
         train_rmse_b = np.sqrt(np.mean((y_b_90 - pred_train_b_90) ** 2))
         train_skill_b = weighted_rmse_score(y_b_90, pred_train_b_90, w_b_90)
 
-        # --- Pseudo target for Model A': B_90 predictions on full train (leak-free: 10% is OOF) ---
+        # --- Pseudo target for Model A': B_90 predictions on full train (leak-free: 10% is OOF, used for A' training) ---
         train_df = train_df.copy()
         pred_b_train = model_b_90.predict(train_fe_b[feature_cols_b].fillna(0).to_numpy())
         # Align by index: train_fe_b is sorted by entity+ts, train_df may be in read order
@@ -879,7 +1030,7 @@ def _run_step3(cfg, paths, experiment_name=None):
         train_imputed, entity_count_col = create_entity_count(train_imputed, ENTITY_COLS, TS_COL)
         # Same preprocessing as elsewhere: winsorize, log type-C, zero flags, encode
         numeric_to_clip = [c for c in FEATURE_COLS if c in train_imputed.columns]
-        train_imputed, winsor_bounds = winsorize_features(train_imputed, numeric_to_clip, quantiles=(0.01, 0.99), fit_df=train_imputed)
+        train_imputed, winsor_bounds = winsorize_features(train_imputed, numeric_to_clip, quantiles=WINSORIZE_QUANTILES, fit_df=train_imputed)
         type_c_present = [c for c in TYPE_C_FEATURES if c in train_imputed.columns]
         train_imputed = log_transform_type_c(train_imputed, type_c_present)
         train_imputed, zero_flag_cols = create_zero_inflation_flags(train_imputed, ZERO_INFLATED_FEATURES)
@@ -913,53 +1064,43 @@ def _run_step3(cfg, paths, experiment_name=None):
             "global_mean": global_mean, "global_std": global_std or 1.0, "entity_count_from_train": train_df.groupby(ENTITY_COLS).size().reset_index(name="entity_obs_count"),
             "entity_encodings": entity_encodings, "target_transform": None,
         }
-        # --- Model A': 10% temporal validation for early stopping, then train on full ---
+        # --- Model A': 90/10 temporal validation for early stopping (avoid leakage) ---
         X_train_ap = train_imputed[all_feature_cols_ap].fillna(0).to_numpy()
         y_train_ap = train_imputed[TARGET_COL].to_numpy()
         w_train_ap = train_imputed["weight"].to_numpy()
         entity_cat_ap = [c for c in ENTITY_CAT_FEATURE_NAMES if c in all_feature_cols_ap]
-        unique_ts_ap = sorted(train_imputed[TS_COL].unique())
-        split_idx_ap = int(len(unique_ts_ap) * 0.9)
-        cutoff_ap = unique_ts_ap[split_idx_ap]
-        mask_ap_90 = (train_imputed[TS_COL].values <= cutoff_ap)
-        mask_ap_10 = ~mask_ap_90
-        # Entity statistics for sequential-style artifacts: compute from 90%% temporal training slice only.
-        entity_mean_from_train_ap = train_imputed.loc[mask_ap_90].groupby(ENTITY_COLS)[TARGET_COL].mean().reset_index(name="entity_mean")
-        entity_std_from_train_ap = train_imputed.loc[mask_ap_90].groupby(ENTITY_COLS)[TARGET_COL].std().reset_index(name="entity_std")
-        entity_std_from_train_ap["entity_std"] = entity_std_from_train_ap["entity_std"].fillna(global_std or 1.0)
+        mask_ap_90, mask_ap_10 = _temporal_train_val_split(train_imputed, TS_COL, train_fraction=TEMPORAL_TRAIN_FRACTION)
+        # Entity statistics for sequential-style artifacts: compute from 90% temporal training slice only.
+        entity_mean_from_train_ap, entity_std_from_train_ap = _entity_stats_from_train_slice(
+            train_imputed, mask_ap_90, ENTITY_COLS, TARGET_COL, global_std or 1.0
+        )
         artifacts_ap["entity_mean_from_train"] = entity_mean_from_train_ap
         artifacts_ap["entity_std_from_train"] = entity_std_from_train_ap
-        artifacts_ap["missing_threshold"] = 0.01
+        artifacts_ap["missing_threshold"] = MISSING_FEATURE_THRESHOLD
         X_ap_90 = train_imputed.loc[mask_ap_90, all_feature_cols_ap].fillna(0).to_numpy()
         y_ap_90 = train_imputed.loc[mask_ap_90, TARGET_COL].to_numpy()
         w_ap_90 = train_imputed.loc[mask_ap_90, "weight"].to_numpy()
         X_ap_val = train_imputed.loc[mask_ap_10, all_feature_cols_ap].fillna(0).to_numpy()
         y_ap_val = train_imputed.loc[mask_ap_10, TARGET_COL].to_numpy()
         w_ap_val = train_imputed.loc[mask_ap_10, "weight"].to_numpy()
-        params_ap = {
-            "objective": "regression", "metric": "None", "boosting_type": "gbdt",
-            "num_leaves": lb["num_leaves"], "min_data_in_leaf": lb["min_data_in_leaf"],
-            "learning_rate": lb["learning_rate"], "verbose": -1, "seed": lb["seed"],
-        }
-        if lb.get("max_depth", -1) > 0:
-            params_ap["max_depth"] = lb["max_depth"]
+        params_ap = _build_lgb_params(lb, include_max_depth=True)
         train_data_ap_90 = lgb.Dataset(X_ap_90, label=y_ap_90, weight=w_ap_90, feature_name=all_feature_cols_ap, categorical_feature=entity_cat_ap)
         val_data_ap = lgb.Dataset(X_ap_val, label=y_ap_val, weight=w_ap_val, reference=train_data_ap_90)
         feval_ap = make_skill_feval(y_ap_val, w_ap_val, None)
         logger.info("Step 3: training Model A' with 90/10 temporal split")
         model_ap_90 = lgb.train(
             params_ap, train_data_ap_90,
-            num_boost_round=lb.get("num_boost_round", 500),
+            num_boost_round=lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND_MODEL_B),
             valid_sets=[val_data_ap], valid_names=["val"], feval=feval_ap,
-            callbacks=[lgb.log_evaluation(0), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", 50), verbose=False)],
+            callbacks=[lgb.log_evaluation(LOG_EVAL_QUIET_INTERVAL), lgb.early_stopping(stopping_rounds=lb.get("early_stopping_rounds", DEFAULT_EARLY_STOPPING_ROUNDS), verbose=False)],
         )
-        num_rounds_ap = getattr(model_ap_90, "best_iteration", None) or lb.get("num_boost_round", 500)
+        num_rounds_ap = getattr(model_ap_90, "best_iteration", None) or lb.get("num_boost_round", DEFAULT_NUM_BOOST_ROUND_MODEL_B)
         pred_ap_val = model_ap_90.predict(X_ap_val)
         val_rmse_ap = np.sqrt(np.mean((y_ap_val - pred_ap_val) ** 2))
         val_skill_ap = weighted_rmse_score(y_ap_val, pred_ap_val, w_ap_val)
         train_data_ap = lgb.Dataset(X_train_ap, label=y_train_ap, weight=w_train_ap, feature_name=all_feature_cols_ap, categorical_feature=entity_cat_ap)
         logger.info("Step 3: training final Model A' on full train")
-        model_ap = lgb.train(params_ap, train_data_ap, num_boost_round=num_rounds_ap, callbacks=[lgb.log_evaluation(100)])
+        model_ap = lgb.train(params_ap, train_data_ap, num_boost_round=num_rounds_ap, callbacks=[lgb.log_evaluation(LOG_EVAL_FULL_INTERVAL)])
         pred_train_ap = model_ap.predict(X_train_ap)
         train_rmse_ap = np.sqrt(np.mean((y_train_ap - pred_train_ap) ** 2))
         train_skill_ap = weighted_rmse_score(y_train_ap, pred_train_ap, w_train_ap)
@@ -973,9 +1114,11 @@ def _run_step3(cfg, paths, experiment_name=None):
         }
 
         # --- Model B on full train: for test prediction only (keeps A' validation leak-free) ---
+        # We train B_full separately for test-time predictions. This ensures A' validation metrics remain
+        # leak-free since A' was trained using only B_90's OOF predictions.
         train_data_b_full = lgb.Dataset(X_train_b, label=y_train_b, weight=w_train_b, feature_name=feature_cols_b, categorical_feature=entity_cat)
         logger.info("Step 3: training Model B on full train for test prediction only")
-        model_b_full = lgb.train(params_b, train_data_b_full, num_boost_round=num_rounds_b, callbacks=[lgb.log_evaluation(100)])
+        model_b_full = lgb.train(params_b, train_data_b_full, num_boost_round=num_rounds_b, callbacks=[lgb.log_evaluation(LOG_EVAL_FULL_INTERVAL)])
         pred_train_b_full = model_b_full.predict(X_train_b)
         step3_metrics["model_b_full_train_skill"] = float(weighted_rmse_score(y_train_b, pred_train_b_full, w_train_b))
         step3_metrics["model_b_full_train_rmse"] = float(np.sqrt(np.mean((y_train_b - pred_train_b_full) ** 2)))
@@ -985,7 +1128,7 @@ def _run_step3(cfg, paths, experiment_name=None):
         test_df = _load_parquet_cached(test_path).copy()
         # Model B preprocessing on test: use B-specific artifacts where applicable
         test_base = apply_imputation(test_df, artifacts_b.get("impute_values", impute_values))
-        test_base, _ = create_missing_indicators(test_base, FEATURE_COLS, missing_threshold=artifacts_ap.get("missing_threshold", 0.01))
+        test_base, _ = create_missing_indicators(test_base, FEATURE_COLS, missing_threshold=artifacts_ap.get("missing_threshold", MISSING_FEATURE_THRESHOLD))
         test_base = apply_winsorize_bounds(test_base, winsor_bounds)
         type_c_present = [c for c in TYPE_C_FEATURES if c in test_base.columns]
         test_base = log_transform_type_c(test_base, type_c_present)
@@ -1054,8 +1197,7 @@ def _run_step3(cfg, paths, experiment_name=None):
                 test_base[c] = 0.0
         X_test_ap = test_base[all_feature_cols_ap].fillna(0).to_numpy()
         pred_v3 = model_ap.predict(X_test_ap)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out_dir, f"submission_v3_{ts}.csv")
+        out_path = _submission_output_path(out_dir, 3)
         _write_submission(test_base, pred_v3, out_path)
         metadata = _build_metadata("step3", step3_metrics, cfg)
         _write_metadata(metadata, out_path, out_dir)
@@ -1068,19 +1210,56 @@ def _run_step3(cfg, paths, experiment_name=None):
 # Main
 # -----------------------------------------------------------------------------
 
+def _validate_config(cfg):
+    """Validate that required config keys exist. Raises ValueError if missing."""
+    required_keys = ["input_lags", "target_lags", "lightgbm"]
+    missing = [k for k in required_keys if k not in cfg]
+    if missing:
+        raise ValueError(f"Missing required config keys: {missing}")
+
+
+def _validate_paths(paths, step):
+    """Validate that required paths exist for a step. Raises FileNotFoundError if missing."""
+    if step in ("1", "all"):
+        if not os.path.isfile(paths["train_path"]):
+            raise FileNotFoundError(f"Training data not found: {paths['train_path']}")
+        if not os.path.isfile(paths["test_path"]):
+            raise FileNotFoundError(f"Test data not found: {paths['test_path']}")
+    if step in ("2", "all"):
+        errors_path = os.path.join(paths["out_dir"], VALIDATION_ERRORS_FILENAME)
+        if not os.path.isfile(errors_path):
+            raise FileNotFoundError(f"Step 1 must be run first. Missing: {errors_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Three-step submission pipeline (v1, v2, v3).")
     parser.add_argument("--step", type=str, default="all", choices=["1", "2", "3", "all"], help="Run step 1, 2, 3, or all.")
     parser.add_argument("--config", type=str, default=None, help="Path to config YAML. Default: project_root/config.yaml.")
     parser.add_argument("--experiment", type=str, default=None, help="MLflow experiment name. If set, log metadata and artifacts for each step.")
     args = parser.parse_args()
-    config_path = args.config or os.path.join(_project_root, "config.yaml")
+    config_path = args.config or os.path.join(_project_root, DEFAULT_CONFIG_FILENAME)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     logger.info("Loading config from %s", config_path)
-    cfg = load_config(config_path)
+    
+    try:
+        cfg = load_config(config_path)
+        _validate_config(cfg)
+    except Exception as e:
+        logger.error("Failed to load or validate config: %s", e)
+        raise
+    
     paths = _get_paths(cfg)
-    paths["data_dir"] = os.path.join(_project_root, cfg.get("data_dir", "data"))
+    # Ensure data_dir is absolute path (already handled in _get_paths, but keep for consistency)
+    if not os.path.isabs(paths["data_dir"]):
+        paths["data_dir"] = os.path.join(_project_root, cfg.get("data_dir", DEFAULT_DATA_DIR))
     os.makedirs(paths["out_dir"], exist_ok=True)
+    
+    try:
+        _validate_paths(paths, args.step)
+    except FileNotFoundError as e:
+        logger.error("Path validation failed: %s", e)
+        raise
+    
     experiment_name = args.experiment
 
     if args.step in ("1", "all"):
